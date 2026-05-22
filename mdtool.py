@@ -3,12 +3,14 @@
 mdtool - manual CLI utility for working with markdown stored in a local
 GitHub repository using Microsoft Word on Windows.
 
-Version 1 supports:
+Supports:
     - configuration mode (--config, or auto-triggered when config.ini is absent)
     - --fromgit: bootstrap .docx working copies from .md files
+    - --togit: convert edited .docx files back to .md, extracting and
+      compositing images
 
-Out of scope for v1: --togit, git/GitHub integration, recursive traversal,
-filesystem monitoring, image import.
+Out of scope: git/GitHub integration, recursive directory traversal,
+filesystem monitoring.
 """
 
 from __future__ import annotations
@@ -793,7 +795,12 @@ NS = {
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
     "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+    "wps": "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
 }
+
+MC_FALLBACK_TAG = f"{{{NS['mc']}}}Fallback"
+MC_CHOICE_TAG = f"{{{NS['mc']}}}Choice"
 
 
 # ---------------------------------------------------------------------------
@@ -916,18 +923,769 @@ def _record_sync(docx_path: Path, state: Dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Page number tracking
+# ---------------------------------------------------------------------------
+#
+# OOXML does not store explicit page numbers; layout is dynamic. Word does
+# insert <w:lastRenderedPageBreak/> markers in runs after each layout pass,
+# and explicit page breaks appear as <w:br w:type="page"/>. Counting both
+# in document order up to a target element gives a page number that is
+# accurate as of the last time Word laid out the document.
+#
+# Build a single map once at the start of a conversion and look up element
+# pages from it. Cheap, deterministic, and avoids quadratic walks.
+
+class PageTracker:
+    def __init__(self, doc) -> None:
+        # Map id(element) -> page number for every body descendant.
+        self._page_by_id: Dict[int, int] = {}
+        page = 1
+        for el in _iter_skipping_fallback(doc.element.body):
+            self._page_by_id[id(el)] = page
+            tag = el.tag
+            if tag == qn("w:lastRenderedPageBreak"):
+                page += 1
+            elif tag == qn("w:br") and el.get(qn("w:type")) == "page":
+                page += 1
+
+    def page_for(self, element) -> int:
+        if element is None:
+            return 1
+        # Walk up until we find an element we have a page for.
+        cur = element
+        while cur is not None:
+            pg = self._page_by_id.get(id(cur))
+            if pg is not None:
+                return pg
+            cur = cur.getparent()
+        return 1
+
+
+def _iter_skipping_fallback(root):
+    """Iterate root and all descendants, but skip subtrees inside
+    <mc:Fallback>. The fallback is the legacy VML version of content that
+    is also present in DrawingML inside <mc:Choice>; iterating both would
+    double-count shapes and confuse drawing detection.
+    """
+    if root.tag == MC_FALLBACK_TAG:
+        return
+    yield root
+    for child in root:
+        yield from _iter_skipping_fallback(child)
+
+
+def _iter_drawings_in(element):
+    """Yield <w:drawing> descendants of element in document order,
+    excluding any inside <mc:Fallback>."""
+    for el in _iter_skipping_fallback(element):
+        if el.tag == qn("w:drawing"):
+            yield el
+
+
+def _fail_with_page(message: str, page: Optional[int]) -> None:
+    suffix = f" (page {page})" if page else ""
+    fail(message + suffix)
+
+
+# ---------------------------------------------------------------------------
+# Floating shape parsing
+# ---------------------------------------------------------------------------
+#
+# v1 supports a constrained subset of DrawingML shapes that commonly serve
+# as annotation overlays on screenshots:
+#
+#   - rect          : rectangle (optional fill, optional outline)
+#   - line          : straight line
+#   - straightConnector1..5 : straight connector lines (lines with optional
+#     arrowheads at either end)
+#   - ellipse       : ellipse / oval
+#
+# Shapes carrying text are supported when their preset geometry is rect or
+# ellipse (text-only callouts not supported).
+#
+# Anything outside this set raises fail-fast with the shape type and page.
+
+SUPPORTED_SHAPE_GEOMETRY = {
+    "rect", "ellipse",
+    "line",
+    "straightConnector1", "straightConnector2", "straightConnector3",
+    "straightConnector4", "straightConnector5",
+}
+LINE_GEOMETRIES = {
+    "line",
+    "straightConnector1", "straightConnector2", "straightConnector3",
+    "straightConnector4", "straightConnector5",
+}
+
+
+class FloatingShape:
+    """A parsed floating shape, in EMU coordinates relative to the page-
+    level container the anchor uses (we treat positionH/V offsets as the
+    shape's position; the caller decides whether that position is contained
+    within the inline image's extent)."""
+
+    __slots__ = (
+        "kind", "x_emu", "y_emu", "width_emu", "height_emu",
+        "fill_rgb", "stroke_rgb", "stroke_width_emu",
+        "flip_h", "flip_v", "rotation_60k",
+        "head_end_present", "tail_end_present",
+        "text_runs",
+        "text_anchor", "text_ins_l", "text_ins_t", "text_ins_r", "text_ins_b",
+    )
+
+    def __init__(self):
+        self.kind: str = ""
+        self.x_emu: int = 0
+        self.y_emu: int = 0
+        self.width_emu: int = 0
+        self.height_emu: int = 0
+        self.fill_rgb: Optional[Tuple[int, int, int]] = None
+        self.stroke_rgb: Optional[Tuple[int, int, int]] = None
+        self.stroke_width_emu: int = 0
+        self.flip_h: bool = False
+        self.flip_v: bool = False
+        self.rotation_60k: int = 0  # 60000ths of a degree, OOXML convention
+        self.head_end_present: bool = False
+        self.tail_end_present: bool = False
+        # text_runs: list of (text, {bold, italic, size_pt, rgb})
+        self.text_runs: List[Tuple[str, Dict]] = []
+        # bodyPr properties. Defaults match Word's defaults when unspecified.
+        self.text_anchor: str = "t"  # 't' (top), 'ctr' (centre), 'b' (bottom)
+        self.text_ins_l: int = 91440   # 0.1 inch
+        self.text_ins_t: int = 45720   # 0.05 inch
+        self.text_ins_r: int = 91440
+        self.text_ins_b: int = 45720
+
+
+def _parse_srgb(el) -> Optional[Tuple[int, int, int]]:
+    """Extract an sRGB triple from <a:srgbClr val="HHHHHH"/> inside el."""
+    if el is None:
+        return None
+    clr = el.find(f".//{{{NS['a']}}}srgbClr")
+    if clr is None:
+        return None
+    val = clr.get("val", "")
+    if len(val) != 6:
+        return None
+    try:
+        return (int(val[0:2], 16), int(val[2:4], 16), int(val[4:6], 16))
+    except ValueError:
+        return None
+
+
+def _parse_shape_text(wsp_el) -> List[Tuple[str, Dict]]:
+    """Extract text runs from a <wps:txbx> child of a wps:wsp shape."""
+    txbx = wsp_el.find(f"{{{NS['wps']}}}txbx")
+    if txbx is None:
+        return []
+    content = txbx.find(f"{{{NS['w']}}}txbxContent")
+    if content is None:
+        return []
+    out: List[Tuple[str, Dict]] = []
+    for r in content.iter(qn("w:r")):
+        rPr = r.find(qn("w:rPr"))
+        fmt: Dict = {"bold": False, "italic": False, "size_pt": None,
+                     "rgb": None}
+        if rPr is not None:
+            if rPr.find(qn("w:b")) is not None:
+                fmt["bold"] = True
+            if rPr.find(qn("w:i")) is not None:
+                fmt["italic"] = True
+            sz = rPr.find(qn("w:sz"))
+            if sz is not None:
+                try:
+                    # w:sz val is in half-points.
+                    fmt["size_pt"] = int(sz.get(qn("w:val"), "0")) / 2.0
+                except ValueError:
+                    pass
+            color = rPr.find(qn("w:color"))
+            if color is not None:
+                cval = color.get(qn("w:val"), "")
+                if len(cval) == 6:
+                    try:
+                        fmt["rgb"] = (
+                            int(cval[0:2], 16),
+                            int(cval[2:4], 16),
+                            int(cval[4:6], 16),
+                        )
+                    except ValueError:
+                        pass
+        parts: List[str] = []
+        for child in r:
+            if child.tag == qn("w:t") and child.text:
+                parts.append(child.text)
+            elif child.tag == qn("w:tab"):
+                parts.append("\t")
+            elif child.tag == qn("w:br"):
+                parts.append("\n")
+        text = "".join(parts)
+        if text:
+            out.append((text, fmt))
+    return out
+
+
+def _parse_anchor_drawing(drawing_el, page: int, docx_path: Path
+                          ) -> Optional[FloatingShape]:
+    """Parse a <w:drawing> with <wp:anchor>. Returns None if the anchor
+    holds a picture (handled by image extraction); otherwise returns the
+    parsed FloatingShape. Fails fast for unsupported shape kinds."""
+    anchor = drawing_el.find(f"{{{NS['wp']}}}anchor")
+    if anchor is None:
+        return None  # not an anchored drawing
+
+    # If the anchor's graphic data is a picture, this is a floating image,
+    # not an annotation shape. We surface it as the existing fail-fast in
+    # the image-extraction code path; here we just return None so the
+    # caller can detect "contains picture" via separate logic.
+    graphic_data = anchor.find(
+        f".//{{{NS['a']}}}graphicData"
+    )
+    if graphic_data is None:
+        _fail_with_page(
+            f"{docx_path.name} contains an anchored drawing with no graphic "
+            f"data.",
+            page,
+        )
+        return None  # unreachable
+
+    uri = graphic_data.get("uri", "")
+    if uri == "http://schemas.openxmlformats.org/drawingml/2006/picture":
+        # Floating picture (image). Distinct case from shape annotations:
+        # the existing image-extraction fail-fast covers it.
+        return None
+
+    if uri != "http://schemas.microsoft.com/office/word/2010/wordprocessingShape":
+        _fail_with_page(
+            f"{docx_path.name} contains an unsupported anchored drawing "
+            f"type ({uri!r}). Only word-processing shapes are supported "
+            f"as image annotations.",
+            page,
+        )
+        return None  # unreachable
+
+    wsp = graphic_data.find(f"{{{NS['wps']}}}wsp")
+    if wsp is None:
+        _fail_with_page(
+            f"{docx_path.name} contains a shape with no wps:wsp body.",
+            page,
+        )
+        return None  # unreachable
+
+    shape = FloatingShape()
+
+    # Position: <wp:positionH><wp:posOffset>, <wp:positionV><wp:posOffset>.
+    pos_h = anchor.find(f"{{{NS['wp']}}}positionH")
+    pos_v = anchor.find(f"{{{NS['wp']}}}positionV")
+    if pos_h is None or pos_v is None:
+        _fail_with_page(
+            f"{docx_path.name} contains an anchored shape without explicit "
+            f"position offsets; only absolute-offset positioning is "
+            f"supported.",
+            page,
+        )
+        return None  # unreachable
+    off_h = pos_h.find(f"{{{NS['wp']}}}posOffset")
+    off_v = pos_v.find(f"{{{NS['wp']}}}posOffset")
+    if off_h is None or off_v is None or off_h.text is None or off_v.text is None:
+        _fail_with_page(
+            f"{docx_path.name} contains an anchored shape positioned by "
+            f"alignment rather than absolute offset, which cannot be "
+            f"reliably positioned over an inline image.",
+            page,
+        )
+        return None  # unreachable
+    try:
+        shape.x_emu = int(off_h.text)
+        shape.y_emu = int(off_v.text)
+    except ValueError:
+        _fail_with_page(
+            f"{docx_path.name} contains an anchored shape with non-numeric "
+            f"position offset.",
+            page,
+        )
+        return None  # unreachable
+
+    extent = anchor.find(f"{{{NS['wp']}}}extent")
+    if extent is None:
+        _fail_with_page(
+            f"{docx_path.name} contains an anchored shape with no extent.",
+            page,
+        )
+        return None  # unreachable
+    try:
+        shape.width_emu = int(extent.get("cx", "0"))
+        shape.height_emu = int(extent.get("cy", "0"))
+    except ValueError:
+        _fail_with_page(
+            f"{docx_path.name} contains an anchored shape with non-numeric "
+            f"extent.",
+            page,
+        )
+        return None  # unreachable
+
+    sp_pr = wsp.find(f"{{{NS['wps']}}}spPr")
+    if sp_pr is None:
+        _fail_with_page(
+            f"{docx_path.name} contains a shape with no spPr properties.",
+            page,
+        )
+        return None  # unreachable
+
+    # Transform: flip/rotation from <a:xfrm>.
+    xfrm = sp_pr.find(f"{{{NS['a']}}}xfrm")
+    if xfrm is not None:
+        shape.flip_h = xfrm.get("flipH", "0") == "1"
+        shape.flip_v = xfrm.get("flipV", "0") == "1"
+        try:
+            shape.rotation_60k = int(xfrm.get("rot", "0"))
+        except ValueError:
+            shape.rotation_60k = 0
+
+    if shape.rotation_60k % (360 * 60000) != 0:
+        _fail_with_page(
+            f"{docx_path.name} contains a rotated shape (rotation is not "
+            f"supported for image annotations in v1).",
+            page,
+        )
+        return None  # unreachable
+
+    # Geometry: <a:prstGeom prst="...">.
+    prst_geom = sp_pr.find(f"{{{NS['a']}}}prstGeom")
+    if prst_geom is None:
+        _fail_with_page(
+            f"{docx_path.name} contains a shape without a preset geometry; "
+            f"only preset shapes (rect, ellipse, line, connectors) are "
+            f"supported.",
+            page,
+        )
+        return None  # unreachable
+    prst = prst_geom.get("prst", "")
+    if prst not in SUPPORTED_SHAPE_GEOMETRY:
+        _fail_with_page(
+            f"{docx_path.name} contains a shape with unsupported geometry "
+            f"{prst!r}. Supported: rectangle, ellipse, straight line, "
+            f"straight connectors.",
+            page,
+        )
+        return None  # unreachable
+    shape.kind = "line" if prst in LINE_GEOMETRIES else prst
+
+    # Fill: <a:solidFill> for solid; <a:noFill/> means no fill.
+    if sp_pr.find(f"{{{NS['a']}}}noFill") is None:
+        solid = sp_pr.find(f"{{{NS['a']}}}solidFill")
+        if solid is not None:
+            shape.fill_rgb = _parse_srgb(solid)
+            if shape.fill_rgb is None:
+                # Gradient/pattern/scheme color: degrade silently to no fill.
+                # Documented v1 limitation.
+                pass
+
+    # Stroke: <a:ln w="EMU">[<a:solidFill>][<a:headEnd/>][<a:tailEnd/>]</a:ln>.
+    ln = sp_pr.find(f"{{{NS['a']}}}ln")
+    if ln is not None:
+        try:
+            shape.stroke_width_emu = int(ln.get("w", "0"))
+        except ValueError:
+            shape.stroke_width_emu = 0
+        if ln.find(f"{{{NS['a']}}}noFill") is None:
+            shape.stroke_rgb = _parse_srgb(ln)
+        head_end = ln.find(f"{{{NS['a']}}}headEnd")
+        tail_end = ln.find(f"{{{NS['a']}}}tailEnd")
+        if head_end is not None and head_end.get("type", "none") != "none":
+            shape.head_end_present = True
+        if tail_end is not None and tail_end.get("type", "none") != "none":
+            shape.tail_end_present = True
+    # Lines without an explicit ln default to a thin black stroke in Word.
+    if shape.kind == "line" and shape.stroke_rgb is None and ln is None:
+        shape.stroke_rgb = (0, 0, 0)
+        shape.stroke_width_emu = 9525  # ~0.75pt
+
+    # Text content for text boxes.
+    if shape.kind in ("rect", "ellipse"):
+        shape.text_runs = _parse_shape_text(wsp)
+        # bodyPr governs how text sits inside the shape: vertical anchor
+        # and per-edge insets. Missing values fall back to Word's defaults.
+        body_pr = wsp.find(f"{{{NS['wps']}}}bodyPr")
+        if body_pr is not None:
+            anchor = body_pr.get("anchor", "t")
+            if anchor in ("t", "ctr", "b"):
+                shape.text_anchor = anchor
+            for attr, field in (("lIns", "text_ins_l"),
+                                ("tIns", "text_ins_t"),
+                                ("rIns", "text_ins_r"),
+                                ("bIns", "text_ins_b")):
+                val = body_pr.get(attr)
+                if val is not None:
+                    try:
+                        setattr(shape, field, int(val))
+                    except ValueError:
+                        pass
+    else:
+        text_runs = _parse_shape_text(wsp)
+        if text_runs:
+            _fail_with_page(
+                f"{docx_path.name} contains a non-rectangular text-bearing "
+                f"shape, which v1 does not support.",
+                page,
+            )
+            return None  # unreachable
+
+    return shape
+
+
+def _inline_image_extent(drawing_el, page: int,
+                         docx_path: Path) -> Tuple[int, int]:
+    """Return (cx, cy) EMU for an inline image. Caller has verified inline."""
+    inline = drawing_el.find(f"{{{NS['wp']}}}inline")
+    extent = inline.find(f"{{{NS['wp']}}}extent")
+    if extent is None:
+        _fail_with_page(
+            f"{docx_path.name} has an inline image with no display extent.",
+            page,
+        )
+        return (0, 0)  # unreachable
+    try:
+        return (int(extent.get("cx", "0")), int(extent.get("cy", "0")))
+    except ValueError:
+        _fail_with_page(
+            f"{docx_path.name} has an inline image with non-numeric extent.",
+            page,
+        )
+        return (0, 0)  # unreachable
+
+
+def _shape_within_extent(shape: FloatingShape,
+                         image_extent: Tuple[int, int]) -> bool:
+    """Whether the shape's full bounding box lies inside an image whose
+    origin is treated as (0, 0) and extent is image_extent (in EMU).
+
+    A small tolerance handles rounding noise from Word."""
+    cx, cy = image_extent
+    tol = 9525  # ~0.75 point (one stroke width) of slack
+    return (
+        shape.x_emu >= -tol
+        and shape.y_emu >= -tol
+        and (shape.x_emu + shape.width_emu) <= cx + tol
+        and (shape.y_emu + shape.height_emu) <= cy + tol
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shape rendering with Pillow
+# ---------------------------------------------------------------------------
+
+def _emu_to_px_f(emu: float, dpi: int = IMAGE_DPI) -> float:
+    return emu * dpi / 914400.0
+
+
+def _pick_font(size_px: int):
+    """Pick a TrueType font path. Tries common Windows fonts first
+    (since the tool targets Windows), then Linux/macOS fallbacks, then
+    Pillow's default bitmap font as last resort."""
+    from PIL import ImageFont
+    candidates = [
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\calibri.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=max(8, int(size_px)))
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def _composite_shapes(base_img, shapes: List[FloatingShape],
+                      image_extent_emu: Tuple[int, int]) -> "Image.Image":
+    """Render shapes on top of base_img (which is the inline image already
+    scaled to its Word display size at IMAGE_DPI). All shape coordinates
+    are interpreted as offsets in EMU from the image origin."""
+    from PIL import Image as PILImage, ImageDraw
+
+    # Scale factor from EMU to pixels in the rendered image. The rendered
+    # image's pixel width may be slightly smaller than display-size at
+    # IMAGE_DPI because we never upscale beyond the original; compute the
+    # actual scale.
+    img_cx_emu, img_cy_emu = image_extent_emu
+    if img_cx_emu <= 0 or img_cy_emu <= 0:
+        return base_img
+    scale_x = base_img.width / img_cx_emu
+    scale_y = base_img.height / img_cy_emu
+
+    def px_x(emu: float) -> float:
+        return emu * scale_x
+
+    def px_y(emu: float) -> float:
+        return emu * scale_y
+
+    # Composite onto an RGBA canvas to handle transparency cleanly.
+    if base_img.mode != "RGBA":
+        canvas = base_img.convert("RGBA")
+    else:
+        canvas = base_img.copy()
+    draw = ImageDraw.Draw(canvas, "RGBA")
+
+    for shape in shapes:
+        if shape.kind == "rect":
+            _draw_rect_shape(draw, canvas, shape, px_x, px_y)
+        elif shape.kind == "ellipse":
+            _draw_ellipse_shape(draw, canvas, shape, px_x, px_y)
+        elif shape.kind == "line":
+            _draw_line_shape(draw, shape, px_x, px_y)
+        # Unsupported kinds are rejected upstream.
+
+    return canvas
+
+
+def _draw_rect_shape(draw, canvas, shape: FloatingShape,
+                     px_x, px_y) -> None:
+    x0 = px_x(shape.x_emu)
+    y0 = px_y(shape.y_emu)
+    x1 = px_x(shape.x_emu + shape.width_emu)
+    y1 = px_y(shape.y_emu + shape.height_emu)
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+
+    if shape.fill_rgb is not None:
+        draw.rectangle([x0, y0, x1, y1], fill=shape.fill_rgb + (255,))
+
+    if shape.stroke_rgb is not None:
+        sw = max(1, int(round(_emu_to_px_f(shape.stroke_width_emu or 9525))))
+        draw.rectangle(
+            [x0, y0, x1, y1],
+            outline=shape.stroke_rgb + (255,),
+            width=sw,
+        )
+
+    if shape.text_runs:
+        _draw_text_in_box(canvas, draw, shape, x0, y0, x1, y1)
+
+
+def _draw_ellipse_shape(draw, canvas, shape: FloatingShape,
+                        px_x, px_y) -> None:
+    x0 = px_x(shape.x_emu)
+    y0 = px_y(shape.y_emu)
+    x1 = px_x(shape.x_emu + shape.width_emu)
+    y1 = px_y(shape.y_emu + shape.height_emu)
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+
+    if shape.fill_rgb is not None:
+        draw.ellipse([x0, y0, x1, y1], fill=shape.fill_rgb + (255,))
+    if shape.stroke_rgb is not None:
+        sw = max(1, int(round(_emu_to_px_f(shape.stroke_width_emu or 9525))))
+        draw.ellipse(
+            [x0, y0, x1, y1],
+            outline=shape.stroke_rgb + (255,),
+            width=sw,
+        )
+
+    if shape.text_runs:
+        _draw_text_in_box(canvas, draw, shape, x0, y0, x1, y1)
+
+
+def _draw_line_shape(draw, shape: FloatingShape, px_x, px_y) -> None:
+    # The line spans the bounding box diagonally; flipH / flipV choose
+    # which diagonal. With no flips, line runs from top-left to bottom-right.
+    x_lo = px_x(shape.x_emu)
+    y_lo = px_y(shape.y_emu)
+    x_hi = px_x(shape.x_emu + shape.width_emu)
+    y_hi = px_y(shape.y_emu + shape.height_emu)
+
+    if shape.flip_h:
+        x_start, x_end = x_hi, x_lo
+    else:
+        x_start, x_end = x_lo, x_hi
+    if shape.flip_v:
+        y_start, y_end = y_hi, y_lo
+    else:
+        y_start, y_end = y_lo, y_hi
+
+    color_rgb = shape.stroke_rgb if shape.stroke_rgb is not None else (0, 0, 0)
+    color = color_rgb + (255,)
+    sw = max(1, int(round(_emu_to_px_f(shape.stroke_width_emu or 9525))))
+
+    draw.line(
+        [(x_start, y_start), (x_end, y_end)],
+        fill=color,
+        width=sw,
+    )
+
+    # Arrowheads. headEnd is at (x_start, y_start) per OOXML convention
+    # (head = where the line "starts" in shape coordinates); tailEnd is at
+    # (x_end, y_end). We always draw at the actual endpoint, with the
+    # triangle pointing along the line direction towards that endpoint.
+    if shape.head_end_present:
+        _draw_arrowhead(draw, x_end, y_end, x_start, y_start, color, sw)
+    if shape.tail_end_present:
+        _draw_arrowhead(draw, x_start, y_start, x_end, y_end, color, sw)
+
+
+def _draw_arrowhead(draw, from_x: float, from_y: float,
+                    to_x: float, to_y: float,
+                    fill, stroke_width: int) -> None:
+    """Draw a filled triangular arrowhead pointing from (from_x, from_y)
+    toward (to_x, to_y), with the tip at (to_x, to_y)."""
+    import math
+    dx = to_x - from_x
+    dy = to_y - from_y
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return
+    ux, uy = dx / length, dy / length
+    # Arrowhead size scales with stroke width; Word uses several preset
+    # sizes but for v1 we pick a single sensible default.
+    head_len = max(6.0, stroke_width * 4.0)
+    head_half_w = max(4.0, stroke_width * 2.5)
+    # Base centre (back of the triangle).
+    bx = to_x - ux * head_len
+    by = to_y - uy * head_len
+    # Perpendicular unit vector.
+    px, py = -uy, ux
+    p1 = (to_x, to_y)
+    p2 = (bx + px * head_half_w, by + py * head_half_w)
+    p3 = (bx - px * head_half_w, by - py * head_half_w)
+    draw.polygon([p1, p2, p3], fill=fill)
+
+
+def _draw_text_in_box(canvas, draw, shape: FloatingShape,
+                      x0: float, y0: float, x1: float, y1: float) -> None:
+    """Render text_runs inside the rectangle [x0,y0,x1,y1]. Applies
+    bodyPr insets to derive the content area, then uses bodyPr anchor to
+    position the text block vertically (t/ctr/b). Lines are centred
+    horizontally within the content area. v1 limitations:
+    - no word wrapping (text overflows if too long)
+    - single font per shape (uses the first run's size)
+    - colour from the first run (or black)
+    - horizontal alignment always centred (Word's default for shapes)"""
+    if not shape.text_runs:
+        return
+
+    # Convert EMU insets to pixels using the box's pixel-per-EMU scale.
+    # We derive scale from the shape's bounding box because that is the only
+    # information we have linking EMU to the rendered pixels for this shape.
+    box_w_emu = max(1, shape.width_emu)
+    box_h_emu = max(1, shape.height_emu)
+    box_w_px = x1 - x0
+    box_h_px = y1 - y0
+    sx = box_w_px / box_w_emu
+    sy = box_h_px / box_h_emu
+
+    inset_l = shape.text_ins_l * sx
+    inset_r = shape.text_ins_r * sx
+    inset_t = shape.text_ins_t * sy
+    inset_b = shape.text_ins_b * sy
+
+    content_x0 = x0 + inset_l
+    content_x1 = x1 - inset_r
+    content_y0 = y0 + inset_t
+    content_y1 = y1 - inset_b
+    if content_x1 <= content_x0:
+        content_x0, content_x1 = x0, x1
+    if content_y1 <= content_y0:
+        content_y0, content_y1 = y0, y1
+    content_w = content_x1 - content_x0
+    content_h = content_y1 - content_y0
+
+    # Default styling from the first run.
+    first_fmt = shape.text_runs[0][1]
+    size_pt = first_fmt.get("size_pt") or 11.0
+    size_px = int(round(size_pt * IMAGE_DPI / 72.0))
+    color_rgb = first_fmt.get("rgb") or (0, 0, 0)
+    bold = first_fmt.get("bold", False)
+    italic = first_fmt.get("italic", False)
+
+    # Concatenate runs into lines (split on newline tokens).
+    text = "".join(t for t, _ in shape.text_runs)
+    lines = text.splitlines() or [text]
+
+    font = _pick_font_styled(size_px, bold=bold, italic=italic)
+
+    # Measure line heights with the picked font.
+    try:
+        line_heights = [
+            (draw.textbbox((0, 0), line, font=font)[3]
+             - draw.textbbox((0, 0), line, font=font)[1])
+            or size_px
+            for line in lines
+        ]
+    except Exception:
+        line_heights = [size_px] * len(lines)
+    total_h = sum(line_heights)
+
+    # Vertical anchor: t = top, ctr = centre, b = bottom.
+    if shape.text_anchor == "ctr":
+        cur_y = content_y0 + max(0, (content_h - total_h) / 2.0)
+    elif shape.text_anchor == "b":
+        cur_y = content_y1 - total_h
+    else:
+        cur_y = content_y0
+
+    for line, lh in zip(lines, line_heights):
+        try:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_w = bbox[2] - bbox[0]
+        except Exception:
+            line_w = size_px * len(line)
+        tx = content_x0 + max(0, (content_w - line_w) / 2.0)
+        draw.text((tx, cur_y), line, fill=color_rgb + (255,), font=font)
+        cur_y += lh
+
+
+def _pick_font_styled(size_px: int, *, bold: bool, italic: bool):
+    """Pick a font, attempting bold/italic variants on Windows."""
+    from PIL import ImageFont
+    base_candidates = []
+    if bold and italic:
+        base_candidates = [
+            "C:\\Windows\\Fonts\\arialbi.ttf",
+            "C:\\Windows\\Fonts\\calibriz.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+        ]
+    elif bold:
+        base_candidates = [
+            "C:\\Windows\\Fonts\\arialbd.ttf",
+            "C:\\Windows\\Fonts\\calibrib.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ]
+    elif italic:
+        base_candidates = [
+            "C:\\Windows\\Fonts\\ariali.ttf",
+            "C:\\Windows\\Fonts\\calibrii.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        ]
+    for path in base_candidates:
+        try:
+            return ImageFont.truetype(path, size=max(8, int(size_px)))
+        except (OSError, IOError):
+            continue
+    return _pick_font(size_px)
+
+
+# ---------------------------------------------------------------------------
 # Tracked changes
 # ---------------------------------------------------------------------------
 
-def _check_tracked_changes(doc, docx_path: Path) -> None:
+def _check_tracked_changes(doc, docx_path: Path,
+                           tracker: PageTracker) -> None:
     body_xml = doc.element.body
-    # findall returns lists; use simple xpath for any descendant.
     ins = body_xml.find(f".//{{{NS['w']}}}ins")
     dele = body_xml.find(f".//{{{NS['w']}}}del")
-    if ins is not None or dele is not None:
-        fail(
+    offender = ins if ins is not None else dele
+    if offender is not None:
+        page = tracker.page_for(offender)
+        _fail_with_page(
             f"{docx_path.name} contains unresolved tracked changes. "
-            f"Accept or reject all changes in Word before running --togit."
+            f"Accept or reject all changes in Word before running --togit.",
+            page,
         )
 
 
@@ -954,34 +1712,43 @@ def _emu_to_px(emu: int, dpi: int = IMAGE_DPI) -> int:
     return max(1, int(round(emu * dpi / 914400)))
 
 
-def _extract_inline_image(drawing_el, doc, docx_path: Path) -> ExtractedImage:
-    """Render a single inline image found inside a <w:drawing> element.
-
-    Anchored/floating images are rejected per spec.
-    """
+def _extract_inline_image(drawing_el, doc, docx_path: Path,
+                          page: int,
+                          overlay_shapes: List[FloatingShape]
+                          ) -> ExtractedImage:
+    """Render a single inline image found inside a <w:drawing> element,
+    optionally compositing floating annotation shapes on top."""
     # Reject anchored/floating images.
     if drawing_el.find(f"{{{NS['wp']}}}anchor") is not None:
-        fail(
+        _fail_with_page(
             f"{docx_path.name} contains a floating or anchored image. "
-            f"Only inline images are supported."
+            f"Only inline images are supported.",
+            page,
         )
 
     inline = drawing_el.find(f"{{{NS['wp']}}}inline")
     if inline is None:
-        fail(
+        _fail_with_page(
             f"{docx_path.name} contains a drawing element with no inline "
-            f"layout; only inline images are supported."
+            f"layout; only inline images are supported.",
+            page,
         )
 
     # Extent (display size in EMU).
     extent = inline.find(f"{{{NS['wp']}}}extent")
     if extent is None:
-        fail(f"{docx_path.name} has an inline image with no display extent.")
+        _fail_with_page(
+            f"{docx_path.name} has an inline image with no display extent.",
+            page,
+        )
     try:
         cx = int(extent.get("cx", "0"))
         cy = int(extent.get("cy", "0"))
     except ValueError:
-        fail(f"{docx_path.name} has an inline image with non-numeric extent.")
+        _fail_with_page(
+            f"{docx_path.name} has an inline image with non-numeric extent.",
+            page,
+        )
         cx = cy = 0  # unreachable
 
     # Alt text from docPr/@descr (preferred) or @title.
@@ -991,38 +1758,41 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path) -> ExtractedImage:
         alt_text = (doc_pr.get("descr") or doc_pr.get("title") or "").strip()
 
     # Find the blip (image reference) and optional srcRect (cropping).
-    blip = inline.find(
-        f".//{{{NS['a']}}}blip"
-    )
+    blip = inline.find(f".//{{{NS['a']}}}blip")
     if blip is None:
-        fail(f"{docx_path.name} has an inline image with no blip reference.")
+        _fail_with_page(
+            f"{docx_path.name} has an inline image with no blip reference.",
+            page,
+        )
     r_embed = blip.get(f"{{{NS['r']}}}embed")
     if not r_embed:
-        fail(
+        _fail_with_page(
             f"{docx_path.name} has an inline image with no r:embed "
-            f"relationship."
+            f"relationship.",
+            page,
         )
 
-    src_rect = inline.find(
-        f".//{{{NS['a']}}}srcRect"
-    )
+    src_rect = inline.find(f".//{{{NS['a']}}}srcRect")
 
     # Resolve relationship to image part.
     try:
         image_part = doc.part.related_parts[r_embed]
     except KeyError:
-        fail(
+        _fail_with_page(
             f"{docx_path.name} references missing image relationship "
-            f"{r_embed!r}."
+            f"{r_embed!r}.",
+            page,
         )
         return None  # unreachable
 
     content_type = image_part.content_type
     if content_type not in SUPPORTED_IMAGE_CONTENT_TYPES:
-        fail(
+        _fail_with_page(
             f"{docx_path.name} contains an unsupported image type "
-            f"{content_type!r}. Only PNG and JPEG are supported."
+            f"{content_type!r}. Only PNG and JPEG are supported.",
+            page,
         )
+        return None  # unreachable
     out_ext = SUPPORTED_IMAGE_CONTENT_TYPES[content_type]
 
     # Render via Pillow.
@@ -1030,7 +1800,10 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path) -> ExtractedImage:
         src_img = Image.open(io.BytesIO(image_part.blob))
         src_img.load()
     except Exception as exc:
-        fail(f"Failed to decode an image in {docx_path.name}: {exc}")
+        _fail_with_page(
+            f"Failed to decode an image in {docx_path.name}: {exc}",
+            page,
+        )
         return None  # unreachable
 
     # Apply cropping if specified. srcRect values are in 1/100000 (i.e.
@@ -1042,7 +1815,10 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path) -> ExtractedImage:
             r = int(src_rect.get("r", "0")) / 100000.0
             b = int(src_rect.get("b", "0")) / 100000.0
         except ValueError:
-            fail(f"{docx_path.name} has non-numeric image crop metadata.")
+            _fail_with_page(
+                f"{docx_path.name} has non-numeric image crop metadata.",
+                page,
+            )
             return None  # unreachable
         w, h = src_img.size
         left = max(0, int(round(w * l)))
@@ -1050,24 +1826,38 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path) -> ExtractedImage:
         right = min(w, int(round(w * (1.0 - r))))
         bottom = min(h, int(round(h * (1.0 - b))))
         if right <= left or bottom <= top:
-            fail(
+            _fail_with_page(
                 f"{docx_path.name} has an image crop that collapses to "
-                f"zero area; cannot render reliably."
+                f"zero area; cannot render reliably.",
+                page,
             )
+            return None  # unreachable
         src_img = src_img.crop((left, top, right, bottom))
 
-    # Resize to Word's display size (downscale only, never upscale).
+    # Resize to Word's display size. Always rescale (up or down) so images
+    # rendered at the same width in Word produce assets at the same width.
+    # Aspect ratio comes from Word's (cx, cy) extent, which mirrors the
+    # source proportions unless the user deliberately distorted them.
     target_w = _emu_to_px(cx)
     target_h = _emu_to_px(cy)
-    if target_w < src_img.width or target_h < src_img.height:
-        src_img.thumbnail((target_w, target_h), Image.LANCZOS)
+    if (src_img.width, src_img.height) != (target_w, target_h):
+        src_img = src_img.resize((target_w, target_h), Image.LANCZOS)
 
-    # Encode bytes deterministically. PNG uses optimize; JPEG uses quality=90.
+    # Composite floating annotation shapes onto the rendered image.
+    if overlay_shapes:
+        src_img = _composite_shapes(src_img, overlay_shapes, (cx, cy))
+        # Compositing produces RGBA; ensure the output format can handle it.
+        if out_ext == "jpg" and src_img.mode == "RGBA":
+            # JPEG has no alpha channel; flatten onto white before save.
+            from PIL import Image as PILImage
+            bg = PILImage.new("RGB", src_img.size, (255, 255, 255))
+            bg.paste(src_img, mask=src_img.split()[3])
+            src_img = bg
+
+    # Encode bytes deterministically.
     buf = io.BytesIO()
     try:
         if out_ext == "png":
-            # Normalise to RGBA->RGB if palette/transparency would otherwise
-            # produce inconsistent output across PIL versions.
             save_img = src_img
             if save_img.mode == "P":
                 save_img = save_img.convert("RGBA")
@@ -1076,7 +1866,10 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path) -> ExtractedImage:
             save_img = src_img.convert("RGB") if src_img.mode != "RGB" else src_img
             save_img.save(buf, format="JPEG", quality=90, optimize=True)
     except Exception as exc:
-        fail(f"Failed to render an image in {docx_path.name}: {exc}")
+        _fail_with_page(
+            f"Failed to render an image in {docx_path.name}: {exc}",
+            page,
+        )
         return None  # unreachable
 
     return ExtractedImage(
@@ -1140,15 +1933,99 @@ class _RunPiece:
         return (self.bold, self.italic, self.code, self.strike, self.link)
 
 
+class _NumberingResolver:
+    """Resolves (numId, ilvl) -> 'bullet' or 'ordered' by reading the
+    document's word/numbering.xml part.
+
+    Word's UI ribbon buttons for numbered/bulleted lists do NOT apply the
+    'List Number'/'List Bullet' styles; instead they apply 'List Paragraph'
+    style with a <w:numPr> reference to a numbering definition. Detecting
+    ordered vs bullet for those paragraphs requires reading numbering.xml
+    and looking up the level's <w:numFmt>.
+
+    Anything with numFmt 'bullet' is unordered; everything else (decimal,
+    lowerLetter/upperLetter, lowerRoman/upperRoman, decimalZero, etc.) is
+    treated as ordered. Style-link references (<w:numStyleLink>,
+    <w:styleLink>) are not resolved in v1; the lookup returns None for
+    those cases and the caller falls back to a conservative default.
+    """
+
+    def __init__(self, doc) -> None:
+        self._kind: Dict[Tuple[str, str], str] = {}
+        self._load(doc)
+
+    def _load(self, doc) -> None:
+        try:
+            numbering_part = doc.part.numbering_part
+        except Exception:
+            numbering_part = None
+        if numbering_part is None:
+            return
+        root = getattr(numbering_part, "element", None)
+        if root is None:
+            return
+
+        # abstractNumId -> {ilvl: numFmt}
+        abstract: Dict[str, Dict[str, str]] = {}
+        for an in root.findall(qn("w:abstractNum")):
+            an_id = an.get(qn("w:abstractNumId"))
+            if an_id is None:
+                continue
+            levels: Dict[str, str] = {}
+            for lvl in an.findall(qn("w:lvl")):
+                ilvl = lvl.get(qn("w:ilvl"))
+                nf = lvl.find(qn("w:numFmt"))
+                if ilvl is not None and nf is not None:
+                    levels[ilvl] = nf.get(qn("w:val"), "")
+            abstract[an_id] = levels
+
+        # numId -> abstractNumId (+ per-level overrides via w:lvlOverride)
+        for num in root.findall(qn("w:num")):
+            num_id = num.get(qn("w:numId"))
+            if num_id is None:
+                continue
+            abs_ref = num.find(qn("w:abstractNumId"))
+            if abs_ref is None:
+                continue
+            an_id = abs_ref.get(qn("w:val"))
+            if an_id is None:
+                continue
+            levels = dict(abstract.get(an_id, {}))
+
+            for ov in num.findall(qn("w:lvlOverride")):
+                ov_ilvl = ov.get(qn("w:ilvl"))
+                ov_lvl = ov.find(qn("w:lvl"))
+                if ov_ilvl is not None and ov_lvl is not None:
+                    nf = ov_lvl.find(qn("w:numFmt"))
+                    if nf is not None:
+                        levels[ov_ilvl] = nf.get(qn("w:val"), "")
+
+            for ilvl, fmt in levels.items():
+                kind = "bullet" if fmt == "bullet" else "ordered"
+                self._kind[(num_id, ilvl)] = kind
+
+    def kind_of(self, num_id: Optional[str],
+                ilvl: Optional[str]) -> Optional[str]:
+        """Returns 'bullet', 'ordered', or None if the lookup could not be
+        resolved (e.g. unknown numId, style-link reference, no numbering
+        part)."""
+        if num_id is None:
+            return None
+        return self._kind.get((num_id, ilvl or "0"))
+
+
 class DocxToMarkdown:
     def __init__(self, doc, docx_path: Path,
-                 image_filenames: List[str]) -> None:
+                 image_filenames: List[str],
+                 tracker: Optional[PageTracker] = None) -> None:
         self.doc = doc
         self.docx_path = docx_path
         # image_filenames[i] is the final filename (no path) for the i-th
         # inline image encountered in document order.
         self.image_filenames = image_filenames
         self._image_counter = 0  # next image index to consume
+        self.tracker = tracker
+        self._numbering = _NumberingResolver(doc)
 
     # --- public ---
 
@@ -1262,10 +2139,21 @@ class DocxToMarkdown:
 
     def _is_list_paragraph(self, para: DocxParagraph) -> bool:
         style_name = (para.style.name if para.style else "") or ""
-        if style_name in ("List Bullet", "List Number", "List Paragraph"):
+        if style_name in ("List Bullet", "List Number"):
             return True
         # User-added Word lists may use numPr without our style names.
-        return self._numpr(para) is not None
+        numPr = self._numpr(para)
+        if numPr is None:
+            # "List Paragraph" without numPr is not a list (just a styled
+            # paragraph leftover from a removed list).
+            return False
+        # numId=0 means "no list reference" (explicit removal from a list).
+        numId_el = numPr.find(qn("w:numId"))
+        if numId_el is None:
+            return False
+        if numId_el.get(qn("w:val"), "0") == "0":
+            return False
+        return True
 
     def _numpr(self, para: DocxParagraph):
         pPr = para._p.find(qn("w:pPr"))
@@ -1297,16 +2185,32 @@ class DocxToMarkdown:
                                 LIST_INDENT_STEP_CM)))
 
     def _is_ordered_list(self, para: DocxParagraph) -> bool:
+        # Explicit style names take precedence (these are what --fromgit
+        # writes) and avoid any dependency on numbering.xml.
         style_name = (para.style.name if para.style else "") or ""
         if style_name == "List Number":
             return True
         if style_name == "List Bullet":
             return False
-        # User-added list via Word UI: inspect numbering definition. As a
-        # heuristic, treat anything with numPr but unknown style as bullet
-        # unless we can determine otherwise. Determining ordered/bullet from
-        # numId requires walking word/numbering.xml; for v1, default to
-        # bullet which matches the common Word UI default.
+
+        # Word-UI-created lists use numPr referring to a definition in
+        # numbering.xml. Look up the numFmt for this (numId, ilvl).
+        numPr = self._numpr(para)
+        if numPr is None:
+            return False
+        numId_el = numPr.find(qn("w:numId"))
+        if numId_el is None:
+            return False
+        num_id = numId_el.get(qn("w:val"))
+        ilvl_el = numPr.find(qn("w:ilvl"))
+        ilvl = ilvl_el.get(qn("w:val")) if ilvl_el is not None else "0"
+        kind = self._numbering.kind_of(num_id, ilvl)
+        if kind == "ordered":
+            return True
+        if kind == "bullet":
+            return False
+        # Unresolved (e.g. style-link reference, or numbering.xml missing).
+        # Conservative default: bullet.
         return False
 
     def _render_list(self, items: List, start: int) -> Tuple[List[str], int]:
@@ -1365,41 +2269,47 @@ class DocxToMarkdown:
         rows = table.rows
         if not rows:
             return ""
+        page = self.tracker.page_for(table._tbl) if self.tracker else None
         for row in rows:
             for cell in row.cells:
                 tc = cell._tc
                 tcPr = tc.find(qn("w:tcPr"))
                 if tcPr is not None:
                     if tcPr.find(qn("w:gridSpan")) is not None:
-                        fail(
+                        _fail_with_page(
                             f"{self.docx_path.name} contains a table with "
                             f"horizontally merged cells (gridSpan), which "
-                            f"GFM pipe tables cannot represent."
+                            f"GFM pipe tables cannot represent.",
+                            page,
                         )
                     if tcPr.find(qn("w:vMerge")) is not None:
-                        fail(
+                        _fail_with_page(
                             f"{self.docx_path.name} contains a table with "
                             f"vertically merged cells (vMerge), which GFM "
-                            f"pipe tables cannot represent."
+                            f"pipe tables cannot represent.",
+                            page,
                         )
                 if tc.find(f".//{{{NS['w']}}}tbl") is not None:
-                    fail(
+                    _fail_with_page(
                         f"{self.docx_path.name} contains a nested table, "
-                        f"which is unsupported."
+                        f"which is unsupported.",
+                        page,
                     )
                 if tc.find(f".//{{{NS['w']}}}drawing") is not None:
-                    fail(
+                    _fail_with_page(
                         f"{self.docx_path.name} contains an image inside a "
-                        f"table cell, which is unsupported."
+                        f"table cell, which is unsupported.",
+                        page,
                     )
 
         ncols = len(rows[0].cells)
         # Detect column count mismatch across rows: also unsupported.
         for r in rows[1:]:
             if len(r.cells) != ncols:
-                fail(
+                _fail_with_page(
                     f"{self.docx_path.name} contains a table with ragged "
-                    f"row widths; cannot map to a GFM pipe table."
+                    f"row widths; cannot map to a GFM pipe table.",
+                    page,
                 )
 
         # First row is the header. Build cell text and per-column alignment.
@@ -1572,7 +2482,11 @@ class DocxToMarkdown:
                     link=None,
                 ))
             elif tag == qn("w:drawing"):
-                # Consume an image slot.
+                # Only INLINE drawings consume an image slot. Anchored
+                # drawings (annotation shapes) have already been composited
+                # into their host inline image by the extractor.
+                if child.find(f"{{{NS['wp']}}}inline") is None:
+                    continue
                 if self._image_counter >= len(self.image_filenames):
                     fail(
                         f"{self.docx_path.name}: encountered more inline "
@@ -1582,6 +2496,26 @@ class DocxToMarkdown:
                 pieces.append(_RunPiece(is_image=True, image_index=idx,
                                         link=link_url))
                 self._image_counter += 1
+
+            elif tag == f"{{{NS['mc']}}}AlternateContent":
+                # Inline images may be wrapped in mc:AlternateContent
+                # (modern format with VML fallback). Look for an inline
+                # drawing inside the mc:Choice subtree.
+                choice = child.find(f"{{{NS['mc']}}}Choice")
+                if choice is None:
+                    continue
+                for d in _iter_drawings_in(choice):
+                    if d.find(f"{{{NS['wp']}}}inline") is None:
+                        continue
+                    if self._image_counter >= len(self.image_filenames):
+                        fail(
+                            f"{self.docx_path.name}: encountered more "
+                            f"inline images than were extracted."
+                        )
+                    idx = self._image_counter
+                    pieces.append(_RunPiece(is_image=True, image_index=idx,
+                                            link=link_url))
+                    self._image_counter += 1
 
     def _emit_pieces(self, pieces: List[_RunPiece], *,
                      in_table: bool) -> str:
@@ -1661,11 +2595,95 @@ class DocxToMarkdown:
 # Conversion orchestration
 # ---------------------------------------------------------------------------
 
-def _walk_inline_drawings(doc):
-    """Yield <w:drawing> elements in document body order."""
+def _collect_inline_images_with_overlays(doc, docx_path: Path,
+                                         tracker: PageTracker):
+    """Walk the document body and yield (drawing_el, page, overlay_shapes)
+    tuples in document order for every inline image.
+
+    Each paragraph's anchored shapes are gathered, then assigned to the
+    inline image they sit on top of (containment-tested against that
+    image's extent). Anchored shapes that are NOT wholly inside an inline
+    image, or paragraphs that have multiple inline images with anchored
+    shapes (ambiguous attribution), trigger fail-fast with the page
+    number."""
     body = doc.element.body
-    for drawing in body.iter(qn("w:drawing")):
-        yield drawing
+    for p_el in body.iter(qn("w:p")):
+        # Discover this paragraph's drawings, excluding mc:Fallback copies.
+        inline_drawings: List = []
+        anchored_drawings: List = []
+        for d in _iter_drawings_in(p_el):
+            # An ancestor walk to confirm the drawing belongs to THIS
+            # paragraph and not a nested paragraph (e.g. inside a textbox
+            # within a shape on this paragraph).
+            ancestor = d.getparent()
+            while ancestor is not None and ancestor is not p_el:
+                if ancestor.tag == qn("w:p"):
+                    break
+                ancestor = ancestor.getparent()
+            if ancestor is not p_el:
+                continue
+            if d.find(f"{{{NS['wp']}}}inline") is not None:
+                inline_drawings.append(d)
+            elif d.find(f"{{{NS['wp']}}}anchor") is not None:
+                anchored_drawings.append(d)
+
+        if not inline_drawings and not anchored_drawings:
+            continue
+
+        page = tracker.page_for(p_el)
+
+        # Parse all anchored shapes for this paragraph.
+        shapes_with_drawings: List[Tuple[FloatingShape, "object"]] = []
+        for ad in anchored_drawings:
+            # If the anchored drawing carries a picture (not a shape), the
+            # existing "no floating images" rule applies. Detect this and
+            # fail-fast with page number.
+            gd = ad.find(f".//{{{NS['a']}}}graphicData")
+            if gd is not None and gd.get("uri", "") == (
+                "http://schemas.openxmlformats.org/drawingml/2006/picture"
+            ):
+                _fail_with_page(
+                    f"{docx_path.name} contains a floating or anchored "
+                    f"image. Only inline images are supported.",
+                    page,
+                )
+            parsed = _parse_anchor_drawing(ad, page, docx_path)
+            if parsed is not None:
+                shapes_with_drawings.append((parsed, ad))
+
+        # If this paragraph has anchored shapes but multiple inline images,
+        # we can't unambiguously decide which image each shape overlays.
+        if shapes_with_drawings and len(inline_drawings) > 1:
+            _fail_with_page(
+                f"{docx_path.name} has a paragraph with multiple inline "
+                f"images plus floating shapes; v1 cannot disambiguate which "
+                f"image each shape overlays.",
+                page,
+            )
+
+        # Assign shapes to inline images by containment.
+        per_image_overlays: Dict[int, List[FloatingShape]] = {
+            id(d): [] for d in inline_drawings
+        }
+        for shape, ad in shapes_with_drawings:
+            assigned = False
+            for d in inline_drawings:
+                extent = _inline_image_extent(d, page, docx_path)
+                if _shape_within_extent(shape, extent):
+                    per_image_overlays[id(d)].append(shape)
+                    assigned = True
+                    break
+            if not assigned:
+                _fail_with_page(
+                    f"{docx_path.name} contains a floating shape "
+                    f"({shape.kind}) that is not wholly inside an inline "
+                    f"image. Only shapes contained within an inline image "
+                    f"are supported.",
+                    page,
+                )
+
+        for d in inline_drawings:
+            yield (d, page, per_image_overlays[id(d)])
 
 
 def _existing_assets_for_doc(git_dir: Path, md_name: str,
@@ -1734,18 +2752,23 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
         )
         return counters  # unreachable
 
-    # Tracked changes: refuse to convert.
-    _check_tracked_changes(doc, docx_path)
+    tracker = PageTracker(doc)
 
-    # Extract and render all inline images in document order.
+    # Tracked changes: refuse to convert.
+    _check_tracked_changes(doc, docx_path, tracker)
+
+    # Extract and render all inline images in document order, compositing
+    # any wholly-contained floating annotation shapes.
     extracted: List[ExtractedImage] = []
-    for drawing_el in _walk_inline_drawings(doc):
-        # Reject if the drawing is anchored (floating). Anchored elements
-        # do not live under w:r/w:drawing inline; but be defensive.
-        if drawing_el.getparent() is None:
-            continue
-        img = _extract_inline_image(drawing_el, doc, docx_path)
+    drawing_order: List = []  # parallel list of inline-drawing elements
+    for drawing_el, page, overlays in _collect_inline_images_with_overlays(
+        doc, docx_path, tracker
+    ):
+        img = _extract_inline_image(
+            drawing_el, doc, docx_path, page, overlays,
+        )
         extracted.append(img)
+        drawing_order.append(drawing_el)
 
     # Resolve filenames for each extracted image by hash, reusing existing
     # files where the content matches.
@@ -1797,7 +2820,8 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
         })
 
     # Render markdown.
-    converter = DocxToMarkdown(doc, docx_path, final_filenames)
+    converter = DocxToMarkdown(doc, docx_path, final_filenames,
+                               tracker=tracker)
     # Stash alts on the converter for emission.
     converter._image_alts = final_alts  # type: ignore[attr-defined]
     md_text = converter.render()
