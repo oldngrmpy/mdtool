@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mdtool - manual CLI utility for working with markdown stored in a local
+mdtool v1.4 - manual CLI utility for working with markdown stored in a local
 GitHub repository using Microsoft Word on Windows.
 
 Supports:
@@ -8,9 +8,22 @@ Supports:
     - --fromgit: bootstrap .docx working copies from .md files
     - --togit: convert edited .docx files back to .md, extracting and
       compositing images
+    - -s / --scale: (--togit modifier) scale extracted images to Word's
+      display size instead of using native source resolution
 
 Out of scope: git/GitHub integration, recursive directory traversal,
 filesystem monitoring.
+
+Changelog:
+    1.4 - Default image output changed to native source resolution.
+          Added -s / --scale to restore previous display-size scaling.
+          Sub-pixel left/right srcRect artefacts from Word's crop tool are
+          now snapped to zero to prevent inconsistent image widths.
+    1.3 - Floating annotation shapes (rectangles, ellipses, lines, arrows,
+          text boxes) composited onto host inline images.
+    1.2 - Image asset manifest and stable filename reuse across syncs.
+    1.1 - --togit image extraction and compositing with Pillow.
+    1.0 - Initial release: --fromgit, --togit, --config.
 """
 
 from __future__ import annotations
@@ -1714,10 +1727,18 @@ def _emu_to_px(emu: int, dpi: int = IMAGE_DPI) -> int:
 
 def _extract_inline_image(drawing_el, doc, docx_path: Path,
                           page: int,
-                          overlay_shapes: List[FloatingShape]
+                          overlay_shapes: List[FloatingShape],
+                          scale_to_display: bool = False,
                           ) -> ExtractedImage:
     """Render a single inline image found inside a <w:drawing> element,
-    optionally compositing floating annotation shapes on top."""
+    optionally compositing floating annotation shapes on top.
+
+    By default the source image is kept at its native pixel dimensions
+    (after any cropping).  When scale_to_display is True the image is
+    rescaled to Word's display size (cx, cy) at IMAGE_DPI instead.
+    Floating annotation shapes are composited at proportionally correct
+    positions in both modes.
+    """
     # Reject anchored/floating images.
     if drawing_el.find(f"{{{NS['wp']}}}anchor") is not None:
         _fail_with_page(
@@ -1808,6 +1829,15 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path,
 
     # Apply cropping if specified. srcRect values are in 1/100000 (i.e.
     # thousandths of a percent). Positive values trim from that edge.
+    #
+    # Word's crop tool frequently writes tiny non-zero l/r values (a few
+    # units out of 100000) even when the user only drags the top/bottom
+    # handles.  When scale_to_display is True this is invisible because
+    # the image is rescaled to cx anyway.  At native resolution those
+    # sub-pixel artefacts produce inconsistent widths across images that
+    # should be identical.  We therefore snap l/r to zero when the
+    # implied crop is less than 1 pixel at native resolution; t/b are
+    # left as-is because vertical slicing is the user's actual intent.
     if src_rect is not None:
         try:
             l = int(src_rect.get("l", "0")) / 100000.0
@@ -1825,6 +1855,12 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path,
         top = max(0, int(round(h * t)))
         right = min(w, int(round(w * (1.0 - r))))
         bottom = min(h, int(round(h * (1.0 - b))))
+        # Snap sub-pixel left/right crops to the full native width so that
+        # images cropped only on the vertical axis share a consistent width.
+        if left < 1:
+            left = 0
+        if right > w - 1:
+            right = w
         if right <= left or bottom <= top:
             _fail_with_page(
                 f"{docx_path.name} has an image crop that collapses to "
@@ -1834,16 +1870,23 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path,
             return None  # unreachable
         src_img = src_img.crop((left, top, right, bottom))
 
-    # Resize to Word's display size. Always rescale (up or down) so images
-    # rendered at the same width in Word produce assets at the same width.
-    # Aspect ratio comes from Word's (cx, cy) extent, which mirrors the
-    # source proportions unless the user deliberately distorted them.
-    target_w = _emu_to_px(cx)
-    target_h = _emu_to_px(cy)
-    if (src_img.width, src_img.height) != (target_w, target_h):
-        src_img = src_img.resize((target_w, target_h), Image.LANCZOS)
+    if scale_to_display:
+        # Resize to Word's display size. Always rescale (up or down) so
+        # images rendered at the same width in Word produce assets at the
+        # same width.  Aspect ratio comes from Word's (cx, cy) extent,
+        # which mirrors source proportions unless deliberately distorted.
+        target_w = _emu_to_px(cx)
+        target_h = _emu_to_px(cy)
+        if (src_img.width, src_img.height) != (target_w, target_h):
+            src_img = src_img.resize((target_w, target_h), Image.LANCZOS)
+    # else: keep native pixel dimensions. Floating shapes are composited by
+    # mapping their EMU coordinates against the native pixel size, which
+    # _composite_shapes handles automatically via its scale_x/scale_y.
 
     # Composite floating annotation shapes onto the rendered image.
+    # Shape positions are in EMU relative to the Word display extent (cx, cy).
+    # _composite_shapes derives px_x/px_y scale from base_img.size vs (cx, cy),
+    # so it handles both display-size and native-size output correctly.
     if overlay_shapes:
         src_img = _composite_shapes(src_img, overlay_shapes, (cx, cy))
         # Compositing produces RGBA; ensure the output format can handle it.
@@ -2734,7 +2777,9 @@ def _allocate_image_filename(prefix: str, ext: str,
 
 
 def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
-                             manifest: Dict) -> Dict[str, int]:
+                             manifest: Dict,
+                             scale_to_display: bool = False,
+                             ) -> Dict[str, int]:
     """Convert a single .docx to .md, manage assets, update manifest.
 
     Returns counters: extracted, reused, removed.
@@ -2766,6 +2811,7 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
     ):
         img = _extract_inline_image(
             drawing_el, doc, docx_path, page, overlays,
+            scale_to_display=scale_to_display,
         )
         extracted.append(img)
         drawing_order.append(drawing_el)
@@ -2941,7 +2987,8 @@ def _check_docx_ambiguity(docx_files: List[Path]) -> None:
             )
 
 
-def run_togit(cfg: Dict[str, str]) -> None:
+def run_togit(cfg: Dict[str, str],
+              scale_to_display: bool = False) -> None:
     git_dir = Path(cfg["GitDir"])
     work_dir = Path(cfg["WorkDir"])
 
@@ -2987,7 +3034,10 @@ def run_togit(cfg: Dict[str, str]) -> None:
             continue
 
         print(f"Converting: {docx.name} -> {md_match.name}")
-        counters = convert_docx_to_markdown(docx, md_match, git_dir, manifest)
+        counters = convert_docx_to_markdown(
+            docx, md_match, git_dir, manifest,
+            scale_to_display=scale_to_display,
+        )
         totals["converted"] += 1
         totals["extracted"] += counters["extracted"]
         totals["reused"] += counters["reused"]
@@ -3081,6 +3131,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Update .md files in GitDir from edited .docx files in WorkDir.",
     )
+    parser.add_argument(
+        "-s", "--scale",
+        action="store_true",
+        dest="scale_to_display",
+        help=(
+            "Scale images to Word's display size instead of using the "
+            "native source resolution. Floating annotation shapes are "
+            "composited at proportionally scaled positions. This flag may "
+            "cause all images to be regenerated in the destination."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -3112,7 +3173,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.fromgit:
         run_fromgit(existing_cfg)
     else:
-        run_togit(existing_cfg)
+        run_togit(existing_cfg, scale_to_display=args.scale_to_display)
 
 
 if __name__ == "__main__":

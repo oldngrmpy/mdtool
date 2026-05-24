@@ -1,4 +1,4 @@
-# mdtool
+# mdtool v1.4
 
 ## Description
 
@@ -40,23 +40,33 @@ The tool operates only on already-synchronised local files. It does not push, pu
 
 ## Usage
 
-`mdtool` exposes three flags. Exactly one operation must be specified per invocation.
+`mdtool` exposes three operation flags; exactly one must be specified per invocation. An optional modifier flag is available for `--togit`.
 
-| Flag         | Purpose                                                                 |
-|--------------|-------------------------------------------------------------------------|
-| `--config`   | Re-run interactive configuration. Overwrites `config.ini`.              |
-| `--fromgit`  | Generate `.docx` working copies in `WorkDir` from `.md` files in `GitDir`. |
-| `--togit`    | Convert edited `.docx` files in `WorkDir` back to `.md` files in `GitDir`. |
+| Flag              | Purpose                                                                         |
+|-------------------|---------------------------------------------------------------------------------|
+| `--config`        | Re-run interactive configuration. Overwrites `config.ini`.                      |
+| `--fromgit`       | Generate `.docx` working copies in `WorkDir` from `.md` files in `GitDir`.     |
+| `--togit`         | Convert edited `.docx` files in `WorkDir` back to `.md` files in `GitDir`.     |
+| `-s` / `--scale`  | *(modifier for `--togit`)* Scale extracted images to Word's display size instead of using native source resolution. |
 
 Examples:
 
 ```
 python mdtool.py --fromgit
 python mdtool.py --togit
+python mdtool.py --togit -s
 python mdtool.py --config
 ```
 
 `--fromgit` and `--togit` are mutually exclusive. If neither is supplied (and config is present), the tool exits with an error.
+
+### Image resolution
+
+By default, `--togit` extracts images at their native source resolution — the actual pixel dimensions of the image embedded in the `.docx` file, after any cropping applied in Word. This preserves maximum image quality and is the recommended mode.
+
+Passing `-s` / `--scale` instead scales each image to Word's configured display size at 150 DPI. Use this if you need all images to be a predictable, document-controlled width regardless of their source resolution.
+
+Switching between the two modes will cause all images to be regenerated in the destination `assets/` directory on the next `--togit` run, since the output pixel dimensions differ.
 
 ## General workflow
 
@@ -82,6 +92,25 @@ Round-tripping the same file repeatedly is supported: the tool tracks file state
 - **Word-side formatting drift.** Custom styles, manual formatting, or layout changes applied in Word that do not correspond to a Markdown construct will be lost on `--togit`.
 - **No conflict resolution.** If both the `.md` file in `GitDir` and its `.docx` working copy in `WorkDir` have been edited independently, the tool does not detect or merge the divergence. Whichever operation you run last wins.
 - **No undo.** Conversions overwrite the destination file once written.
+
+## Changelog
+
+**1.4**
+- Default image output changed to native source resolution. Images are now extracted at their actual embedded pixel dimensions rather than being scaled to Word's display size.
+- Added `-s` / `--scale` flag to restore the previous display-size scaling behaviour.
+- Sub-pixel left/right crop artefacts introduced by Word's crop tool are now snapped to zero, preventing inconsistent widths across images that were cropped only on the vertical axis.
+
+**1.3**
+- Floating annotation shapes (rectangles, ellipses, lines, arrows, text boxes) that sit wholly within an inline image are composited onto that image during `--togit`.
+
+**1.2**
+- Image asset manifest added for stable filename reuse across syncs.
+
+**1.1**
+- `--togit` image extraction and compositing with Pillow.
+
+**1.0**
+- Initial release: `--fromgit`, `--togit`, `--config`.
 
 ## Disclaimer
 
