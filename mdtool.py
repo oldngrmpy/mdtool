@@ -1,20 +1,43 @@
 #!/usr/bin/env python3
 """
-mdtool v1.4 - manual CLI utility for working with markdown stored in a local
-GitHub repository using Microsoft Word on Windows.
+mdtool v1.5  (25 May 2026)
+https://github.com/oldngrmpy/mdtool
 
-Supports:
-    - configuration mode (--config, or auto-triggered when config.ini is absent)
-    - --fromgit: bootstrap .docx working copies from .md files
-    - --togit: convert edited .docx files back to .md, extracting and
-      compositing images
-    - -s / --scale: (--togit modifier) scale extracted images to Word's
-      display size instead of using native source resolution
+Manual CLI utility for managing Markdown files via Microsoft Word on Windows.
+Converts .md files from a local Git repository into .docx working copies,
+and converts edited .docx files back to .md. Word is the editing surface;
+Markdown remains the source of truth.
+
+Usage:
+    mdtool config             interactive configuration (also auto-triggered
+                              when config.ini is absent)
+    mdtool fromgit            generate .docx working copies from .md files
+    mdtool togit              convert edited .docx files back to .md,
+                              extracting and compositing images
+    mdtool togit -s/--scale   as above, scaling images to Word's display size
+                              instead of native source resolution
+    mdtool newfile <name>     create a new .md stub and .docx working copy
+
+Image directionality note:
+    Images flow from .docx to .md only (togit direction). Annotation shapes
+    composited onto images in Word are baked into the extracted PNG and are
+    not recoverable as editable Word objects. Cropping is applied at
+    extraction time and not stored in a reversible form. Do not rely on a
+    .docx working copy as the authoritative source for image content.
 
 Out of scope: git/GitHub integration, recursive directory traversal,
 filesystem monitoring.
 
 Changelog:
+    1.5 (25 May 2026)
+        Subcommand CLI: `config`, `fromgit`, `togit`, `newfile` replace --flags.
+        --scale is now a togit-only option; other subcommands reject it.
+        run_config_mode returns bool instead of calling sys.exit internally.
+        State file now records scale_to_display so switching between native
+        and scaled image mode forces re-extraction even if the .docx is
+        unchanged.
+        fromgit always defines all 6 heading styles in generated .docx files.
+        newfile subcommand creates a .md stub and .docx working copy.
     1.4 - Default image output changed to native source resolution.
           Added -s / --scale to restore previous display-size scaling.
           Sub-pixel left/right srcRect artefacts from Word's crop tool are
@@ -22,8 +45,8 @@ Changelog:
     1.3 - Floating annotation shapes (rectangles, ellipses, lines, arrows,
           text boxes) composited onto host inline images.
     1.2 - Image asset manifest and stable filename reuse across syncs.
-    1.1 - --togit image extraction and compositing with Pillow.
-    1.0 - Initial release: --fromgit, --togit, --config.
+    1.1 - togit image extraction and compositing with Pillow.
+    1.0 - Initial release.
 """
 
 from __future__ import annotations
@@ -154,7 +177,12 @@ def write_config(path: Path, cfg: Dict[str, str]) -> None:
         fail(f"Failed to write {path}: {exc}")
 
 
-def run_config_mode(existing: Optional[Dict[str, str]]) -> None:
+def run_config_mode(existing: Optional[Dict[str, str]]) -> bool:
+    """Interactively prompt for configuration values and write config.ini.
+
+    Returns True if configuration was written, False if the user cancelled.
+    Exits via fail() on unrecoverable errors.
+    """
     print("Entering configuration mode.")
     new_cfg: Dict[str, str] = {}
 
@@ -168,7 +196,6 @@ def run_config_mode(existing: Optional[Dict[str, str]]) -> None:
             value = input(prompt).strip()
         except EOFError:
             fail("Input ended unexpectedly during configuration.")
-            return  # unreachable
         if not value:
             value = default
         if not value:
@@ -183,11 +210,10 @@ def run_config_mode(existing: Optional[Dict[str, str]]) -> None:
         confirm = input("Confirm and write config? [y/n]: ").strip().lower()
     except EOFError:
         fail("Input ended unexpectedly during confirmation.")
-        return  # unreachable
 
     if confirm != "y":
         print("Configuration cancelled.")
-        sys.exit(0)
+        return False
 
     # Validate that all configured paths exist as directories.
     for key in CONFIG_KEYS:
@@ -200,7 +226,7 @@ def run_config_mode(existing: Optional[Dict[str, str]]) -> None:
 
     write_config(config_path(), new_cfg)
     print(f"Configuration written to {config_path()}.")
-    sys.exit(0)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +300,18 @@ def _ensure_styles(doc) -> None:
         p_pr = s.element.get_or_add_pPr()
         p_pr.append(_shading(CODE_SHADING_FILL))
         _mark_quick_format(s)
+
+    # Ensure all six heading styles are explicitly present in the document
+    # regardless of which heading levels appear in the source markdown.
+    # python-docx only writes a style element for styles that are used;
+    # adding and immediately removing a paragraph forces each style into
+    # the document XML so Word always shows the full H1-H6 gallery.
+    body = doc.element.body
+    for _level in range(1, 7):
+        _style_name = f"Heading {_level}"
+        if _style_name not in existing:
+            _p = doc.add_paragraph(style=_style_name)
+            body.remove(_p._element)
 
 
 # ---------------------------------------------------------------------------
@@ -863,12 +901,15 @@ def save_manifest(git_dir: Path, manifest: Dict) -> None:
 # Sync state (per-WorkDir change detection)
 # ---------------------------------------------------------------------------
 #
-# Records mtime + size of each .docx at the time of its last successful
-# conversion. A subsequent --togit run skips files whose mtime AND size
-# match the recorded values. mtime+size combined is cheap, deterministic,
-# and good enough in practice; a content hash would catch the (rare) case
-# of an edit that preserves both, at the cost of hashing every file each
-# run.
+# Records mtime, size, and scale_to_display for each .docx at the time of
+# its last successful conversion. A subsequent togit run skips a file only
+# when all three values match: mtime AND size (file unchanged) AND the same
+# image scaling mode as last time (so switching between native and scaled
+# mode forces a full re-extraction even if the .docx itself is unmodified).
+#
+# mtime+size is cheap and deterministic; a content hash would catch the
+# (rare) case of an edit that preserves both, at the cost of hashing every
+# file each run.
 #
 # Deleting this file forces a full resync on the next run.
 
@@ -910,7 +951,11 @@ def save_state(work_dir: Path, state: Dict) -> None:
         fail(f"Failed to update sync state {path}: {exc}")
 
 
-def _docx_unchanged_since_last_sync(docx_path: Path, state: Dict) -> bool:
+def _docx_unchanged_since_last_sync(
+    docx_path: Path,
+    state: Dict,
+    scale_to_display: bool,
+) -> bool:
     entry = state["files"].get(docx_path.name)
     if not entry:
         return False
@@ -921,14 +966,20 @@ def _docx_unchanged_since_last_sync(docx_path: Path, state: Dict) -> bool:
     return (
         stat.st_mtime == entry.get("mtime")
         and stat.st_size == entry.get("size")
+        and entry.get("scale_to_display") == scale_to_display
     )
 
 
-def _record_sync(docx_path: Path, state: Dict) -> None:
+def _record_sync(
+    docx_path: Path,
+    state: Dict,
+    scale_to_display: bool,
+) -> None:
     stat = docx_path.stat()
     state["files"][docx_path.name] = {
         "mtime": stat.st_mtime,
         "size": stat.st_size,
+        "scale_to_display": scale_to_display,
         "last_synced": datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
@@ -3028,7 +3079,7 @@ def run_togit(cfg: Dict[str, str],
             totals["skipped"] += 1
             continue
 
-        if _docx_unchanged_since_last_sync(docx, state):
+        if _docx_unchanged_since_last_sync(docx, state, scale_to_display):
             print(f"Unchanged, skipping: {docx.name}")
             totals["unchanged"] += 1
             continue
@@ -3047,7 +3098,7 @@ def run_togit(cfg: Dict[str, str],
         # immediately. If a later file in the batch fails fast, the work
         # done up to that point is preserved on disk: re-running --togit
         # will skip already-synced files and retry the failed one.
-        _record_sync(docx, state)
+        _record_sync(docx, state, scale_to_display)
         save_manifest(git_dir, manifest)
         save_state(work_dir, state)
 
@@ -3061,6 +3112,75 @@ def run_togit(cfg: Dict[str, str],
     print(f"Images reused:    {totals['reused']}")
     print(f"Images removed:   {totals['removed']}")
     print(f"Errors:           {totals['errors']}")
+
+
+# ---------------------------------------------------------------------------
+# newfile operation
+# ---------------------------------------------------------------------------
+
+def _newfile_stub(stem: str) -> str:
+    """Return a markdown stub with H1-H6 placeholders."""
+    title = stem.replace("-", " ").replace("_", " ").title()
+    return (
+        f"# {title}\n"
+        "\n"
+        "Replace this text with your document content.\n"
+        "\n"
+        "## Section Heading\n"
+        "\n"
+        "Replace this text with the content of the first section.\n"
+        "\n"
+        "### Subsection Heading\n"
+        "\n"
+        "Replace this text with the content of the subsection.\n"
+        "\n"
+        "#### Sub-subsection Heading\n"
+        "\n"
+        "Replace this text with the content of this section.\n"
+        "\n"
+        "##### Level 5 Heading\n"
+        "\n"
+        "Replace this text with the content of this section.\n"
+        "\n"
+        "###### Level 6 Heading\n"
+        "\n"
+        "Replace this text with the content of this section.\n"
+    )
+
+
+def run_newfile(cfg: Dict[str, str], filename: str) -> None:
+    git_dir = Path(cfg["GitDir"])
+    work_dir = Path(cfg["WorkDir"])
+
+    if not git_dir.is_dir():
+        fail(f"GitDir does not exist or is not a directory: {git_dir}")
+    if not work_dir.is_dir():
+        fail(f"WorkDir does not exist or is not a directory: {work_dir}")
+
+    # Accept "name", "name.md", or "name.docx" — normalise to stem.
+    stem = Path(filename).stem
+    if not stem:
+        fail(f"Invalid filename: {filename!r}")
+
+    md_path = git_dir / (stem + ".md")
+    docx_path = work_dir / (stem + ".docx")
+
+    # Fail fast if either file already exists.
+    if md_path.exists():
+        fail(f"File already exists in GitDir: {md_path}")
+    if docx_path.exists():
+        fail(f"File already exists in WorkDir: {docx_path}")
+
+    stub = _newfile_stub(stem)
+    try:
+        md_path.write_text(stub, encoding="utf-8")
+    except OSError as exc:
+        fail(f"Failed to write {md_path}: {exc}")
+
+    print(f"Created: {md_path}")
+
+    convert_markdown_to_docx(md_path, docx_path)
+    print(f"Created: {docx_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -3116,22 +3236,33 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
             "Operates on an already-synchronised local repository."
         ),
     )
-    parser.add_argument(
-        "--config",
-        action="store_true",
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # -- config subcommand -----------------------------------------------
+    subparsers.add_parser(
+        "config",
         help="Enter interactive configuration mode.",
+        description="Interactively set GitDir and WorkDir, then write config.ini.",
     )
-    parser.add_argument(
-        "--fromgit",
-        action="store_true",
+
+    # -- fromgit subcommand ----------------------------------------------
+    subparsers.add_parser(
+        "fromgit",
         help="Generate .docx working files from .md files in GitDir.",
+        description="Bootstrap .docx working copies from .md source files.",
     )
-    parser.add_argument(
-        "--togit",
-        action="store_true",
+
+    # -- togit subcommand ------------------------------------------------
+    togit_parser = subparsers.add_parser(
+        "togit",
         help="Update .md files in GitDir from edited .docx files in WorkDir.",
+        description=(
+            "Convert edited .docx files back to .md, "
+            "extracting and compositing images."
+        ),
     )
-    parser.add_argument(
+    togit_parser.add_argument(
         "-s", "--scale",
         action="store_true",
         dest="scale_to_display",
@@ -3142,6 +3273,21 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
             "cause all images to be regenerated in the destination."
         ),
     )
+
+    # -- newfile subcommand ----------------------------------------------
+    newfile_parser = subparsers.add_parser(
+        "newfile",
+        help="Create a new .md stub and .docx working copy.",
+        description=(
+            "Create a new markdown stub in GitDir and a matching .docx "
+            "working copy in WorkDir. Fails if either file already exists."
+        ),
+    )
+    newfile_parser.add_argument(
+        "filename",
+        help="Name for the new file (with or without .md extension).",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -3151,29 +3297,28 @@ def main(argv: Optional[List[str]] = None) -> None:
     cfg_path = config_path()
     existing_cfg = load_config(cfg_path)
 
-    # Configuration mode is triggered if config is missing OR --config flag.
-    if args.config or existing_cfg is None:
-        run_config_mode(existing_cfg)
-        return  # run_config_mode calls sys.exit; safety net only.
+    # config subcommand -- also auto-triggered when config.ini is absent.
+    if args.command == "config" or existing_cfg is None:
+        written = run_config_mode(existing_cfg)
+        sys.exit(0 if written else 1)
 
     # Validate present config has both required keys.
     missing = [k for k in CONFIG_KEYS if k not in existing_cfg or not existing_cfg[k]]
     if missing:
         fail(
             f"Config {cfg_path} is missing required keys: {', '.join(missing)}. "
-            f"Re-run with --config."
+            f"Re-run: mdtool config"
         )
 
-    # Require an operational parameter when not in config mode.
-    if args.fromgit and args.togit:
-        fail("--fromgit and --togit are mutually exclusive.")
-    if not args.fromgit and not args.togit:
-        fail("No operation specified. Pass --fromgit, --togit, or --config.")
+    if args.command is None:
+        fail("No command specified. Run 'mdtool --help' for usage.")
 
-    if args.fromgit:
+    if args.command == "fromgit":
         run_fromgit(existing_cfg)
-    else:
+    elif args.command == "togit":
         run_togit(existing_cfg, scale_to_display=args.scale_to_display)
+    elif args.command == "newfile":
+        run_newfile(existing_cfg, args.filename)
 
 
 if __name__ == "__main__":
