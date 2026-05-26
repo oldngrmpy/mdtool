@@ -16,12 +16,14 @@ Usage:
                               extracting and compositing images
     mdtool newfile <name>     create a new .md stub and .docx working copy
 
-Image directionality note:
-    Images flow from .docx to .md only (togit direction). Annotation shapes
-    composited onto images in Word are baked into the extracted PNG and are
-    not recoverable as editable Word objects. Cropping is applied at
-    extraction time and not stored in a reversible form. Do not rely on a
-    .docx working copy as the authoritative source for image content.
+Image handling:
+    fromgit embeds local PNG/JPEG images referenced in .md files as inline
+    images in the generated .docx. togit extracts inline images from .docx
+    files and writes them to GitDir/assets/. Annotation shapes composited
+    onto images in Word are baked into the extracted PNG and are not
+    recoverable as editable Word objects. Cropping is applied at extraction
+    time and not stored in a reversible form. Do not rely on a .docx working
+    copy as the authoritative source for image content.
 
 Out of scope: git/GitHub integration, recursive directory traversal,
 filesystem monitoring.
@@ -3482,9 +3484,3 @@ def main(argv: Optional[List[str]] = None) -> None:
         run_fromgit(existing_cfg)
     elif args.command == "togit":
         run_togit(existing_cfg)
-    elif args.command == "newfile":
-        run_newfile(existing_cfg, args.filename)
-
-
-if __name__ == "__main__":
-    main()
