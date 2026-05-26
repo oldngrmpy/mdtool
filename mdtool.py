@@ -3251,7 +3251,7 @@ def run_togit(cfg: Dict[str, str],
             totals["skipped"] += 1
             continue
 
-        if _docx_unchanged_since_last_sync(docx, state, scale_to_display):
+        if _docx_unchanged_since_last_sync(docx, state):
             print(f"Unchanged, skipping: {docx.name}")
             totals["unchanged"] += 1
             continue
@@ -3270,7 +3270,7 @@ def run_togit(cfg: Dict[str, str],
         # immediately. If a later file in the batch fails fast, the work
         # done up to that point is preserved on disk: re-running --togit
         # will skip already-synced files and retry the failed one.
-        _record_sync(docx, state, scale_to_display)
+        _record_sync(docx, state)
         save_manifest(git_dir, manifest)
         save_state(work_dir, state)
 
