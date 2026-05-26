@@ -176,3 +176,4 @@ A few constraints apply in both directions:
 This tool is provided as-is, without warranty. It modifies files in both `GitDir` and `WorkDir`, and conversions may overwrite existing content.
 
 Before running `togit`, commit or otherwise back up your Markdown source. Before running `fromgit`, ensure you do not have unsaved Word edits you need to keep.
+
