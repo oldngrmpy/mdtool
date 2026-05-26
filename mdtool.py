@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mdtool v1.5  (25 May 2026)
+mdtool v1.6  (26 May 2026)
 https://github.com/oldngrmpy/mdtool
 
 Manual CLI utility for managing Markdown files via Microsoft Word on Windows.
@@ -14,8 +14,6 @@ Usage:
     mdtool fromgit            generate .docx working copies from .md files
     mdtool togit              convert edited .docx files back to .md,
                               extracting and compositing images
-    mdtool togit -s/--scale   as above, scaling images to Word's display size
-                              instead of native source resolution
     mdtool newfile <name>     create a new .md stub and .docx working copy
 
 Image directionality note:
@@ -29,17 +27,28 @@ Out of scope: git/GitHub integration, recursive directory traversal,
 filesystem monitoring.
 
 Changelog:
+    1.6 (26 May 2026)
+        fromgit now embeds local PNG/JPEG images inline in generated .docx
+        files. Display width is derived from embedded DPI metadata (or 96 dpi
+        fallback), capped at 15 cm with aspect ratio preserved; native widths
+        below 15 cm are used as-is (no upscaling). Alt text is written to the
+        OOXML wp:docPr/@descr attribute so togit recovers it on the return
+        trip. Missing files, HTTP/HTTPS URLs, and unsupported formats emit a
+        stderr warning and insert a "[Image not found: ...]" or "[Unsupported
+        image format: ...]" placeholder run instead of failing the conversion.
+        Image paths are recorded in the asset manifest using git_source_path
+        entries (no 'filename' key) so togit allocates fresh asset names
+        without touching the originals. togit guards on entry.get('filename')
+        when reading manifest entries, making it safe to process documents
+        whose manifests were written by fromgit.
+        Removed -s / --scale option. Images always use native source resolution.
+        scale_to_display removed from state file; existing entries are ignored.
     1.5 (25 May 2026)
         Subcommand CLI: `config`, `fromgit`, `togit`, `newfile` replace --flags.
-        --scale is now a togit-only option; other subcommands reject it.
         run_config_mode returns bool instead of calling sys.exit internally.
-        State file now records scale_to_display so switching between native
-        and scaled image mode forces re-extraction even if the .docx is
-        unchanged.
         fromgit always defines all 6 heading styles in generated .docx files.
         newfile subcommand creates a .md stub and .docx working copy.
     1.4 - Default image output changed to native source resolution.
-          Added -s / --scale to restore previous display-size scaling.
           Sub-pixel left/right srcRect artefacts from Word's crop tool are
           now snapped to zero to prevent inconsistent image widths.
     1.3 - Floating annotation shapes (rectangles, ellipses, lines, arrows,
@@ -128,6 +137,10 @@ SUPPORTED_IMAGE_CONTENT_TYPES = {
     "image/jpg": "jpg",
 }
 LIST_INDENT_STEP_CM = 0.75  # Matches --fromgit indent step.
+
+# --fromgit image embedding
+MAX_IMAGE_WIDTH_CM = 15.0    # Maximum display width for embedded inline images.
+FALLBACK_IMAGE_DPI = 96      # DPI assumed when image metadata is absent.
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +331,142 @@ def _ensure_styles(doc) -> None:
 # Markdown -> DOCX conversion
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# fromgit image embedding helpers
+# ---------------------------------------------------------------------------
+
+def _compute_display_width_cm(img: "Image.Image",
+                               max_cm: float = MAX_IMAGE_WIDTH_CM) -> float:
+    """Return the display width in cm for a PIL image.
+
+    Uses the image's embedded DPI metadata (x-axis) when present; falls back
+    to FALLBACK_IMAGE_DPI otherwise. The result is capped at max_cm so images
+    wider than 15 cm are scaled down. Images narrower than max_cm at their
+    native DPI are placed at their native width (no upscaling)."""
+    dpi = float(FALLBACK_IMAGE_DPI)
+    dpi_info = img.info.get("dpi")
+    if dpi_info:
+        try:
+            candidate = float(dpi_info[0])
+            if candidate >= 1.0:
+                dpi = candidate
+        except (TypeError, IndexError, ValueError):
+            pass
+    native_cm = img.width / dpi * 2.54
+    return min(native_cm, max_cm)
+
+
+def _set_inline_image_alt(run, alt_text: str) -> None:
+    """Set the alt-text description on the most recently embedded inline image
+    by writing to the <wp:docPr descr="..."> attribute. No-op if alt_text is
+    empty or the expected XML structure is absent."""
+    if not alt_text:
+        return
+    _WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    drawing = run._element.find(qn("w:drawing"))
+    if drawing is None:
+        return
+    inline = drawing.find(f"{{{_WP}}}inline")
+    if inline is None:
+        return
+    doc_pr = inline.find(f"{{{_WP}}}docPr")
+    if doc_pr is not None:
+        doc_pr.set("descr", alt_text)
+
+
+def _embed_image_or_placeholder(doc, paragraph, src: str, alt: str,
+                                 md_dir: Path,
+                                 manifest_images: Optional[List]) -> None:
+    """Attempt to embed a local PNG/JPEG image inline in paragraph.
+
+    Resolution order:
+      1. HTTP/HTTPS src  → warning + "[Image not found: <src>]" run.
+      2. File not found  → warning + "[Image not found: <name>]" run.
+      3. Unsupported ext → warning + "[Unsupported image format: <name>]" run.
+      4. PIL open fails  → warning + "[Image not found: <name>]" run.
+      5. Success         → embedded inline picture run; alt text set on
+                           wp:docPr/@descr; manifest entry appended.
+    """
+    # HTTP/HTTPS URLs are not fetched at fromgit time.
+    if src.startswith("http://") or src.startswith("https://"):
+        sys.stderr.write(
+            f"WARNING: image URL skipped during fromgit (src={src!r}); "
+            f"inserting placeholder.\n"
+        )
+        paragraph.add_run(f"[Image not found: {src}]")
+        return
+
+    img_path = (md_dir / src).resolve()
+
+    if not img_path.exists():
+        sys.stderr.write(
+            f"WARNING: image not found: {src!r}; inserting placeholder.\n"
+        )
+        paragraph.add_run(f"[Image not found: {img_path.name}]")
+        return
+
+    suffix = img_path.suffix.lower()
+    if suffix not in (".png", ".jpg", ".jpeg"):
+        sys.stderr.write(
+            f"WARNING: unsupported image format {img_path.name!r}; "
+            f"inserting placeholder.\n"
+        )
+        paragraph.add_run(f"[Unsupported image format: {img_path.name}]")
+        return
+
+    try:
+        pil_img = Image.open(str(img_path))
+        pil_img.load()
+    except Exception as exc:
+        sys.stderr.write(
+            f"WARNING: could not open image {img_path.name!r}: {exc}; "
+            f"inserting placeholder.\n"
+        )
+        paragraph.add_run(f"[Image not found: {img_path.name}]")
+        return
+
+    display_width_cm = _compute_display_width_cm(pil_img)
+
+    try:
+        with open(str(img_path), "rb") as fh:
+            img_bytes = fh.read()
+    except OSError as exc:
+        sys.stderr.write(
+            f"WARNING: could not read image {img_path.name!r}: {exc}; "
+            f"inserting placeholder.\n"
+        )
+        paragraph.add_run(f"[Image not found: {img_path.name}]")
+        return
+
+    run = paragraph.add_run()
+    try:
+        run.add_picture(io.BytesIO(img_bytes), width=Cm(display_width_cm))
+    except Exception as exc:
+        sys.stderr.write(
+            f"WARNING: could not embed image {img_path.name!r}: {exc}; "
+            f"inserting placeholder.\n"
+        )
+        paragraph._p.remove(run._element)
+        paragraph.add_run(f"[Image not found: {img_path.name}]")
+        return
+
+    _set_inline_image_alt(run, alt)
+
+    # Record in the manifest. fromgit entries use git_source_path (the
+    # src string as written in the markdown) and deliberately omit the
+    # 'filename' key. togit guards on entry.get('filename') so these
+    # entries are excluded from prev_by_hash / prev_filenames lookups and
+    # the original git asset file is never overwritten.
+    if manifest_images is not None:
+        img_hash = hashlib.sha256(img_bytes).hexdigest()
+        manifest_images.append({
+            "git_source_path": src,
+            "hash": img_hash,
+            "width": pil_img.width,
+            "height": pil_img.height,
+        })
+
+
 class InlineFormat:
     """Mutable bag of inline formatting flags as we walk inline tokens."""
 
@@ -378,8 +527,15 @@ def _wrap_runs_in_hyperlink(paragraph, runs, url: str) -> None:
 
 
 def _render_inline(doc, paragraph, tokens: List[Token],
-                   fmt: InlineFormat, inline_code_style) -> None:
-    """Render an inline token stream into the given paragraph."""
+                   fmt: InlineFormat, inline_code_style,
+                   image_dir: Optional[Path] = None,
+                   manifest_images: Optional[List] = None) -> None:
+    """Render an inline token stream into the given paragraph.
+
+    image_dir and manifest_images are forwarded from BlockRenderer when
+    running in fromgit mode; both are None when called from newfile or
+    any context that does not support image embedding.
+    """
     i = 0
     while i < len(tokens):
         tok = tokens[i]
@@ -435,7 +591,8 @@ def _render_inline(doc, paragraph, tokens: List[Token],
 
             # Snapshot existing runs; render inner; identify new runs; wrap.
             existing_run_elements = set(id(r._element) for r in paragraph.runs)
-            _render_inline(doc, paragraph, inner_tokens, fmt, inline_code_style)
+            _render_inline(doc, paragraph, inner_tokens, fmt, inline_code_style,
+                           image_dir, manifest_images)
             new_runs = [r for r in paragraph.runs
                         if id(r._element) not in existing_run_elements]
             if href:
@@ -447,11 +604,17 @@ def _render_inline(doc, paragraph, tokens: List[Token],
             pass
 
         elif t == "image":
-            # v1: images are out of scope; emit alt text as plain run.
+            src = tok.attrGet("src") or ""
             alt = tok.content or tok.attrGet("alt") or ""
-            if alt:
-                run = paragraph.add_run(alt)
-                _apply_run_formatting(run, fmt, inline_code_style)
+            if image_dir is not None:
+                # fromgit mode: embed the image (or a placeholder on failure).
+                _embed_image_or_placeholder(doc, paragraph, src, alt,
+                                            image_dir, manifest_images)
+            else:
+                # No image context (newfile, etc.): fall back to alt text.
+                if alt:
+                    run = paragraph.add_run(alt)
+                    _apply_run_formatting(run, fmt, inline_code_style)
 
         elif t == "html_inline":
             # v1: raw HTML is out of scope; pass through as literal text so
@@ -481,7 +644,9 @@ def _cell_alignment(style_attr: str) -> Optional[int]:
 class BlockRenderer:
     """Walks a markdown-it block token stream and emits DOCX content."""
 
-    def __init__(self, doc) -> None:
+    def __init__(self, doc,
+                 image_dir: Optional[Path] = None,
+                 manifest_images: Optional[List] = None) -> None:
         self.doc = doc
         self.inline_code_style = doc.styles[INLINE_CODE_STYLE_NAME]
         # Each entry: {"ordered": bool, "level": int}
@@ -493,6 +658,11 @@ class BlockRenderer:
         # Depth of enclosing blockquotes; non-zero means paragraphs not
         # otherwise styled (e.g. by list state) get the Quote style.
         self._blockquote_depth = 0
+        # fromgit image context. image_dir is the directory containing the
+        # source .md file (for resolving relative image paths). manifest_images
+        # is the list accumulating image manifest records for this document.
+        self.image_dir = image_dir
+        self.manifest_images = manifest_images
 
     # -- entry point --
 
@@ -541,6 +711,7 @@ class BlockRenderer:
             _render_inline(
                 self.doc, p, self._inline_tokens_of(tokens, inline_idx),
                 fmt, self.inline_code_style,
+                self.image_dir, self.manifest_images,
             )
             return close_idx + 1
 
@@ -554,6 +725,7 @@ class BlockRenderer:
             _render_inline(
                 self.doc, p, self._inline_tokens_of(tokens, inline_idx),
                 fmt, self.inline_code_style,
+                self.image_dir, self.manifest_images,
             )
             return close_idx + 1
 
@@ -779,13 +951,21 @@ class BlockRenderer:
                     _render_inline(
                         self.doc, target_p, inline_tokens,
                         fmt, self.inline_code_style,
+                        self.image_dir, self.manifest_images,
                     )
                     if alignment is not None:
                         target_p.alignment = alignment
 
 
-def convert_markdown_to_docx(md_path: Path, docx_path: Path) -> None:
-    """Convert one markdown file to a docx working copy. Fail fast on error."""
+def convert_markdown_to_docx(md_path: Path, docx_path: Path,
+                              git_dir: Optional[Path] = None,
+                              manifest: Optional[Dict] = None) -> None:
+    """Convert one markdown file to a docx working copy. Fail fast on error.
+
+    When git_dir and manifest are supplied (fromgit mode), images referenced
+    in the markdown are resolved relative to md_path's directory and embedded
+    inline. Image metadata is written to the manifest keyed by md_path.name.
+    """
     try:
         with open(md_path, "r", encoding="utf-8") as fp:
             md_text = fp.read()
@@ -808,13 +988,26 @@ def convert_markdown_to_docx(md_path: Path, docx_path: Path) -> None:
     doc = Document()
     _ensure_styles(doc)
 
-    renderer = BlockRenderer(doc)
+    manifest_images: List[Dict] = []
+    image_dir = md_path.parent if git_dir is not None else None
+    renderer = BlockRenderer(doc, image_dir=image_dir,
+                             manifest_images=manifest_images)
     renderer.render(tokens)
 
     try:
         doc.save(str(docx_path))
     except OSError as exc:
         fail(f"Failed to write {docx_path}: {exc}")
+
+    # Write manifest entry for any images that were embedded.
+    if git_dir is not None and manifest is not None and manifest_images:
+        md_name = md_path.name
+        manifest["documents"][md_name] = {
+            "images": manifest_images,
+            "updated": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -901,11 +1094,9 @@ def save_manifest(git_dir: Path, manifest: Dict) -> None:
 # Sync state (per-WorkDir change detection)
 # ---------------------------------------------------------------------------
 #
-# Records mtime, size, and scale_to_display for each .docx at the time of
-# its last successful conversion. A subsequent togit run skips a file only
-# when all three values match: mtime AND size (file unchanged) AND the same
-# image scaling mode as last time (so switching between native and scaled
-# mode forces a full re-extraction even if the .docx itself is unmodified).
+# Records mtime and size for each .docx at the time of its last successful
+# conversion. A subsequent togit run skips a file only when both values
+# match (file unchanged).
 #
 # mtime+size is cheap and deterministic; a content hash would catch the
 # (rare) case of an edit that preserves both, at the cost of hashing every
@@ -954,7 +1145,6 @@ def save_state(work_dir: Path, state: Dict) -> None:
 def _docx_unchanged_since_last_sync(
     docx_path: Path,
     state: Dict,
-    scale_to_display: bool,
 ) -> bool:
     entry = state["files"].get(docx_path.name)
     if not entry:
@@ -966,20 +1156,17 @@ def _docx_unchanged_since_last_sync(
     return (
         stat.st_mtime == entry.get("mtime")
         and stat.st_size == entry.get("size")
-        and entry.get("scale_to_display") == scale_to_display
     )
 
 
 def _record_sync(
     docx_path: Path,
     state: Dict,
-    scale_to_display: bool,
 ) -> None:
     stat = docx_path.stat()
     state["files"][docx_path.name] = {
         "mtime": stat.st_mtime,
         "size": stat.st_size,
-        "scale_to_display": scale_to_display,
         "last_synced": datetime.now(timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
@@ -1779,16 +1966,13 @@ def _emu_to_px(emu: int, dpi: int = IMAGE_DPI) -> int:
 def _extract_inline_image(drawing_el, doc, docx_path: Path,
                           page: int,
                           overlay_shapes: List[FloatingShape],
-                          scale_to_display: bool = False,
                           ) -> ExtractedImage:
     """Render a single inline image found inside a <w:drawing> element,
-    optionally compositing floating annotation shapes on top.
+    compositing floating annotation shapes on top.
 
-    By default the source image is kept at its native pixel dimensions
-    (after any cropping).  When scale_to_display is True the image is
-    rescaled to Word's display size (cx, cy) at IMAGE_DPI instead.
+    The source image is kept at its native pixel dimensions after any cropping.
     Floating annotation shapes are composited at proportionally correct
-    positions in both modes.
+    positions.
     """
     # Reject anchored/floating images.
     if drawing_el.find(f"{{{NS['wp']}}}anchor") is not None:
@@ -1883,11 +2067,9 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path,
     #
     # Word's crop tool frequently writes tiny non-zero l/r values (a few
     # units out of 100000) even when the user only drags the top/bottom
-    # handles.  When scale_to_display is True this is invisible because
-    # the image is rescaled to cx anyway.  At native resolution those
-    # sub-pixel artefacts produce inconsistent widths across images that
-    # should be identical.  We therefore snap l/r to zero when the
-    # implied crop is less than 1 pixel at native resolution; t/b are
+    # handles.  Those sub-pixel artefacts produce inconsistent widths across
+    # images that should be identical.  We therefore snap l/r to zero when
+    # the implied crop is less than 1 pixel at native resolution; t/b are
     # left as-is because vertical slicing is the user's actual intent.
     if src_rect is not None:
         try:
@@ -1920,19 +2102,6 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path,
             )
             return None  # unreachable
         src_img = src_img.crop((left, top, right, bottom))
-
-    if scale_to_display:
-        # Resize to Word's display size. Always rescale (up or down) so
-        # images rendered at the same width in Word produce assets at the
-        # same width.  Aspect ratio comes from Word's (cx, cy) extent,
-        # which mirrors source proportions unless deliberately distorted.
-        target_w = _emu_to_px(cx)
-        target_h = _emu_to_px(cy)
-        if (src_img.width, src_img.height) != (target_w, target_h):
-            src_img = src_img.resize((target_w, target_h), Image.LANCZOS)
-    # else: keep native pixel dimensions. Floating shapes are composited by
-    # mapping their EMU coordinates against the native pixel size, which
-    # _composite_shapes handles automatically via its scale_x/scale_y.
 
     # Composite floating annotation shapes onto the rendered image.
     # Shape positions are in EMU relative to the Word display extent (cx, cy).
@@ -2829,7 +2998,6 @@ def _allocate_image_filename(prefix: str, ext: str,
 
 def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
                              manifest: Dict,
-                             scale_to_display: bool = False,
                              ) -> Dict[str, int]:
     """Convert a single .docx to .md, manage assets, update manifest.
 
@@ -2862,7 +3030,6 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
     ):
         img = _extract_inline_image(
             drawing_el, doc, docx_path, page, overlays,
-            scale_to_display=scale_to_display,
         )
         extracted.append(img)
         drawing_order.append(drawing_el)
@@ -2876,8 +3043,13 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
     prev_filenames: set = set()
     if manifest_entry:
         for entry in manifest_entry.get("images", []):
-            prev_by_hash[entry["hash"]] = entry["filename"]
-            prev_filenames.add(entry["filename"])
+            # fromgit entries carry git_source_path but no 'filename' key.
+            # Skip them here so togit allocates a fresh asset name and never
+            # tries to write to the original git file path.
+            fname = entry.get("filename")
+            if fname:
+                prev_by_hash[entry["hash"]] = fname
+                prev_filenames.add(fname)
 
     assets_dir = git_dir / ASSETS_DIR_NAME
 
@@ -3157,7 +3329,7 @@ def run_newfile(cfg: Dict[str, str], filename: str) -> None:
     if not work_dir.is_dir():
         fail(f"WorkDir does not exist or is not a directory: {work_dir}")
 
-    # Accept "name", "name.md", or "name.docx" — normalise to stem.
+    # Accept "name", "name.md", or "name.docx" -- normalise to stem.
     stem = Path(filename).stem
     if not stem:
         fail(f"Invalid filename: {filename!r}")
@@ -3207,6 +3379,8 @@ def run_fromgit(cfg: Dict[str, str]) -> None:
         print(f"No .md files found in {git_dir}.")
         return
 
+    manifest = load_manifest(git_dir)
+
     created = 0
     skipped = 0
 
@@ -3218,8 +3392,12 @@ def run_fromgit(cfg: Dict[str, str]) -> None:
             skipped += 1
             continue
         print(f"Converting: {md.name} -> {docx_name}")
-        convert_markdown_to_docx(md, docx_path)
+        convert_markdown_to_docx(md, docx_path, git_dir=git_dir,
+                                  manifest=manifest)
         created += 1
+
+    if created > 0:
+        save_manifest(git_dir, manifest)
 
     print(f"\nDone. Created: {created}, Skipped: {skipped}.")
 
