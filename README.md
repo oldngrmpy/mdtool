@@ -54,7 +54,6 @@ python mdtool.py <command> [options]
 | `config`             | Re-run interactive configuration. Overwrites `config.ini`.                         |
 | `fromgit`            | Generate `.docx` working copies in `WorkDir` from `.md` files in `GitDir`.        |
 | `togit`              | Convert edited `.docx` files in `WorkDir` back to `.md` files in `GitDir`.        |
-| `togit -s`           | Same as `togit`, but scales extracted images to Word's display size (see below).   |
 | `newfile <filename>` | Create a new `.md` stub in `GitDir` and matching `.docx` in `WorkDir`.            |
 
 Examples:
@@ -62,7 +61,6 @@ Examples:
 ```
 python mdtool.py fromgit
 python mdtool.py togit
-python mdtool.py togit -s
 python mdtool.py config
 python mdtool.py newfile my-document
 python mdtool.py newfile my-document.md
@@ -78,9 +76,7 @@ The filename argument accepts a bare stem (`my-doc`) or a name with extension (`
 
 ### Image extraction (`togit`)
 
-By default, `togit` extracts images at their native source resolution — the actual pixel dimensions of the image embedded in the `.docx` file, after any cropping applied in Word. This preserves maximum image quality and is the recommended mode.
-
-Passing `-s` / `--scale` instead scales each image to Word's configured display size at 150 DPI. Use this if you need all images to be a predictable, document-controlled width regardless of their source resolution.
+`togit` extracts images at their native source resolution — the actual pixel dimensions of the image embedded in the `.docx` file, after any cropping applied in Word.
 
 ## Round-trip safety
 
@@ -148,6 +144,7 @@ A few constraints apply in both directions:
 - Missing files, HTTP/HTTPS URLs, and unsupported formats emit a warning and insert a plain-text placeholder instead of failing the conversion.
 - Image paths found by `fromgit` are recorded in the asset manifest so `togit` can allocate fresh asset names without touching the original git files.
 - `togit` now reads alt text from `wp:docPr/@descr` and emits it in the `![alt](path)` reference in the generated Markdown.
+- `-s` / `--scale` flag deprecated. Images always use native source resolution; the flag is a no-op and will be removed in a future version.
 - Bug fix: `togit` no longer passes the removed `scale_to_display` argument to internal sync-state functions.
 
 **1.5** *(25 May 2026)*
@@ -159,7 +156,7 @@ A few constraints apply in both directions:
 
 **1.4**
 - Default image output changed to native source resolution.
-- Added `-s` / `--scale` flag to restore display-size scaling behaviour.
+- Added `-s` / `--scale` flag (deprecated in 1.6).
 - Sub-pixel left/right crop artefacts from Word's crop tool are snapped to zero.
 
 **1.3**

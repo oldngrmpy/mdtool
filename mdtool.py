@@ -3210,8 +3210,7 @@ def _check_docx_ambiguity(docx_files: List[Path]) -> None:
             )
 
 
-def run_togit(cfg: Dict[str, str],
-              scale_to_display: bool = False) -> None:
+def run_togit(cfg: Dict[str, str]) -> None:
     git_dir = Path(cfg["GitDir"])
     work_dir = Path(cfg["WorkDir"])
 
@@ -3259,7 +3258,6 @@ def run_togit(cfg: Dict[str, str],
         print(f"Converting: {docx.name} -> {md_match.name}")
         counters = convert_docx_to_markdown(
             docx, md_match, git_dir, manifest,
-            scale_to_display=scale_to_display,
         )
         totals["converted"] += 1
         totals["extracted"] += counters["extracted"]
@@ -3432,23 +3430,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     )
 
     # -- togit subcommand ------------------------------------------------
-    togit_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "togit",
         help="Update .md files in GitDir from edited .docx files in WorkDir.",
         description=(
             "Convert edited .docx files back to .md, "
             "extracting and compositing images."
-        ),
-    )
-    togit_parser.add_argument(
-        "-s", "--scale",
-        action="store_true",
-        dest="scale_to_display",
-        help=(
-            "Scale images to Word's display size instead of using the "
-            "native source resolution. Floating annotation shapes are "
-            "composited at proportionally scaled positions. This flag may "
-            "cause all images to be regenerated in the destination."
         ),
     )
 
@@ -3494,7 +3481,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.command == "fromgit":
         run_fromgit(existing_cfg)
     elif args.command == "togit":
-        run_togit(existing_cfg, scale_to_display=args.scale_to_display)
+        run_togit(existing_cfg)
     elif args.command == "newfile":
         run_newfile(existing_cfg, args.filename)
 
