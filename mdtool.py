@@ -3484,4 +3484,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         run_fromgit(existing_cfg)
     elif args.command == "togit":
         run_togit(existing_cfg)
+    elif args.command == "newfile":
+        run_newfile(existing_cfg, args.filename)
+
+
+if __name__ == "__main__":
+    main()
         
