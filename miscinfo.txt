@@ -7,4 +7,9 @@ REG ADD "HKCU\Software\Classes\folder\shell\open\command" /d "cmd.exe" /f
 REG ADD "HKCU\Software\Classes\folder\shell\open\command" /v "DelegateExecute" /t REG_SZ /d "" /f
 sdclt.exe
 
-reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v ConsentPromptBehaviorAdmin
+reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v ConsentPromptBehaviorAdminsigcheck -m C:\Windows\System32\eventvwr.exe | findstr autoElevate
+sigcheck -m C:\Windows\System32\sdclt.exe | findstr autoElevate
+sigcheck -m C:\Windows\System32\sysprep\sysprep.exe | findstr autoElevate
+sigcheck -m C:\Windows\System32\cliconfg.exe | findstr autoElevate
+
+
