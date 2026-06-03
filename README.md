@@ -1,7 +1,7 @@
-# mdtool v1.6
+# mdtool v1.6.1
 
 **Author:** [oldngrmpy](https://github.com/oldngrmpy/mdtool)
-**Released:** 26 May 2026
+**Released:** 3 Jun 2026
 
 ## Description
 
@@ -88,7 +88,7 @@ A few properties of the round-trip are important to understand:
 
 **`togit` skips unchanged files.** File state is tracked in `.mdwordtool-state.json` (in `WorkDir`). A file is skipped only when its modification time and size match the recorded values from the last run.
 
-**Asset filenames are stable across syncs.** An image manifest (`.mdwordtool-manifest.json` in `GitDir/assets/`) maps image content hashes to stable output filenames, so image references in the generated `.md` do not change between runs unless the image itself changes.
+**Asset filenames are stable across syncs.** An image manifest (`.mdwordtool-manifest.json` in `GitDir/assets/`) maps image content hashes to stable output filenames, so image references in the generated `.md` do not change between runs unless the image itself changes. The manifest stores both an encoded-bytes hash and a pixel hash (see [Changelog](#changelog)) so assets are correctly reused across machines with different library versions.
 
 ### Image handling
 
@@ -137,6 +137,10 @@ A few constraints apply in both directions:
 - **No undo.** Conversions overwrite the destination file once written.
 
 ## Changelog
+
+**1.6.1** *(3 Jun 2026)*
+- `togit` now stores a `pixel_hash` (SHA-256 of the raw pixel buffer, computed before encoding) alongside the existing encoded-bytes hash in the asset manifest. Image reuse matches on either hash, so assets are correctly reused across machines with different zlib or libjpeg versions — the bug where `togit` would re-extract all images on a second machine despite an up-to-date repo and manifest.
+- On the first run after upgrading, `pixel_hash` values are retroactively populated from the existing asset files on disk. No re-extraction occurs during the upgrade transition.
 
 **1.6** *(26 May 2026)*
 - `fromgit` now embeds local PNG/JPEG images inline in generated `.docx` files. Display width is derived from embedded DPI metadata (or 96 DPI fallback), capped at 15 cm with aspect ratio preserved. Images narrower than 15 cm at their native DPI are placed at native width (no upscaling).

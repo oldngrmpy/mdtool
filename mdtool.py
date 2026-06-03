@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mdtool v1.6  (26 May 2026)
+mdtool v1.6.1  (3 Jun 2026)
 https://github.com/oldngrmpy/mdtool
 
 Manual CLI utility for managing Markdown files via Microsoft Word on Windows.
@@ -29,6 +29,13 @@ Out of scope: git/GitHub integration, recursive directory traversal,
 filesystem monitoring.
 
 Changelog:
+    1.6.1 (3 Jun 2026)
+        togit now stores a pixel_hash (SHA-256 of raw pixel buffer before
+        encoding) alongside the existing encoded-bytes hash in the asset
+        manifest. Image reuse matches on either hash, so assets are correctly
+        reused across machines with different zlib/libjpeg versions. On the
+        first run after upgrading, pixel_hash values are retroactively
+        populated from existing asset files on disk so no re-extraction occurs.
     1.6 (26 May 2026)
         fromgit now embeds local PNG/JPEG images inline in generated .docx
         files. Display width is derived from embedded DPI metadata (or 96 dpi
@@ -1092,6 +1099,38 @@ def save_manifest(git_dir: Path, manifest: Dict) -> None:
         fail(f"Failed to update manifest {path}: {exc}")
 
 
+def backfill_pixel_hashes(git_dir: Path, manifest: Dict) -> bool:
+    """Populate missing pixel_hash values in manifest entries from asset files on disk.
+
+    For each image entry that has a filename but no pixel_hash, decode the
+    existing asset file with Pillow and hash its raw pixel buffer.  This is a
+    one-time migration step that runs transparently on the first togit
+    invocation after the dual-hash feature is deployed.
+
+    Returns True if any entries were updated (caller should save the manifest).
+    """
+    assets_dir = git_dir / ASSETS_DIR_NAME
+    dirty = False
+    for doc_entry in manifest.get("documents", {}).values():
+        for img in doc_entry.get("images", []):
+            if not img.get("filename"):
+                continue  # fromgit-origin entry; skip
+            if img.get("pixel_hash"):
+                continue  # already populated
+            asset_path = assets_dir / img["filename"]
+            if not asset_path.exists():
+                continue  # file absent; will be re-extracted anyway
+            try:
+                from PIL import Image as _PILImage
+                pil_img = _PILImage.open(str(asset_path))
+                pil_img.load()
+                img["pixel_hash"] = hashlib.sha256(pil_img.tobytes()).hexdigest()
+                dirty = True
+            except Exception:
+                pass  # leave pixel_hash absent; will be a miss this run
+    return dirty
+
+
 # ---------------------------------------------------------------------------
 # Sync state (per-WorkDir change detection)
 # ---------------------------------------------------------------------------
@@ -1947,17 +1986,21 @@ def _check_tracked_changes(doc, docx_path: Path,
 # ---------------------------------------------------------------------------
 
 class ExtractedImage:
-    __slots__ = ("rendered_bytes", "ext", "hash_hex", "alt_text",
-                 "width_px", "height_px")
+    __slots__ = ("rendered_bytes", "ext", "hash_hex", "pixel_hash_hex",
+                 "alt_text", "width_px", "height_px")
 
     def __init__(self, rendered_bytes: bytes, ext: str, alt_text: str,
-                 width_px: int, height_px: int) -> None:
+                 width_px: int, height_px: int,
+                 pixel_hash_hex: str = "") -> None:
         self.rendered_bytes = rendered_bytes
         self.ext = ext
         self.alt_text = alt_text
         self.width_px = width_px
         self.height_px = height_px
         self.hash_hex = hashlib.sha256(rendered_bytes).hexdigest()
+        # Hash of the raw pixel buffer before encoding. Deterministic across
+        # machines regardless of zlib/libjpeg version differences.
+        self.pixel_hash_hex = pixel_hash_hex
 
 
 def _emu_to_px(emu: int, dpi: int = IMAGE_DPI) -> int:
@@ -2119,6 +2162,10 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path,
             bg.paste(src_img, mask=src_img.split()[3])
             src_img = bg
 
+    # Hash raw pixel buffer before encoding so the hash is stable across
+    # machines regardless of zlib/libjpeg version differences.
+    pixel_hash_hex = hashlib.sha256(src_img.tobytes()).hexdigest()
+
     # Encode bytes deterministically.
     buf = io.BytesIO()
     try:
@@ -2143,6 +2190,7 @@ def _extract_inline_image(drawing_el, doc, docx_path: Path,
         alt_text=alt_text,
         width_px=src_img.width,
         height_px=src_img.height,
+        pixel_hash_hex=pixel_hash_hex,
     )
 
 
@@ -3042,6 +3090,7 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
     md_stem = md_path.stem
     manifest_entry = manifest["documents"].get(md_name)
     prev_by_hash: Dict[str, str] = {}
+    prev_by_pixel_hash: Dict[str, str] = {}
     prev_filenames: set = set()
     if manifest_entry:
         for entry in manifest_entry.get("images", []):
@@ -3051,6 +3100,8 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
             fname = entry.get("filename")
             if fname:
                 prev_by_hash[entry["hash"]] = fname
+                if entry.get("pixel_hash"):
+                    prev_by_pixel_hash[entry["pixel_hash"]] = fname
                 prev_filenames.add(fname)
 
     assets_dir = git_dir / ASSETS_DIR_NAME
@@ -3062,10 +3113,16 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
     used_in_this_run: set = set()
 
     for img in extracted:
-        if img.hash_hex in prev_by_hash:
+        # Match on encoded-bytes hash first, then fall back to pixel hash.
+        # The pixel hash is stable across machines regardless of encoder
+        # version; the encoded hash is kept for backward compatibility with
+        # manifests written before pixel_hash was introduced.
+        matched_fname = (prev_by_hash.get(img.hash_hex)
+                         or prev_by_pixel_hash.get(img.pixel_hash_hex))
+        if matched_fname:
             # Reuse existing filename. Verify the file still exists; if it
             # was deleted out-of-band, re-create it.
-            fname = prev_by_hash[img.hash_hex]
+            fname = matched_fname
             target = assets_dir / fname
             if target.exists():
                 counters["reused"] += 1
@@ -3086,6 +3143,7 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
         new_image_records.append({
             "filename": fname,
             "hash": img.hash_hex,
+            "pixel_hash": img.pixel_hash_hex,
             "width": img.width_px,
             "height": img.height_px,
         })
@@ -3232,6 +3290,8 @@ def run_togit(cfg: Dict[str, str]) -> None:
         return
 
     manifest = load_manifest(git_dir)
+    if backfill_pixel_hashes(git_dir, manifest):
+        save_manifest(git_dir, manifest)
     state = load_state(work_dir)
 
     totals = {
