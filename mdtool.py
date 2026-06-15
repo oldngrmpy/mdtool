@@ -1076,24 +1076,56 @@ MC_CHOICE_TAG = f"{{{NS['mc']}}}Choice"
 # ---------------------------------------------------------------------------
 
 def _get_bibliography_style(docx_path: Path) -> Optional[str]:
-    """Return the Word bibliography style name from word/settings.xml, or None.
+    """Return the Word bibliography style name, or None if not set.
 
-    Reads directly from the zip to avoid any python-docx abstraction gap.
-    Returns None if the file is unreadable or the element is absent.
+    Word stores the style in one of two places:
+    1. word/settings.xml  <w:biblioStyle w:val="IEEE"/>  (older/classic path)
+    2. customXml/item1.xml  <b:Sources StyleName="IEEE">  (newer path; the
+       citation source database always lives here when Insert Citation is used)
+
+    We check both and return the first non-empty value found, preferring
+    settings.xml for consistency with the spec.
     """
     W_NS = NS["w"]
+    B_NS = "http://schemas.openxmlformats.org/officeDocument/2006/bibliography"
     try:
         with zipfile.ZipFile(str(docx_path), "r") as zf:
-            if "word/settings.xml" not in zf.namelist():
-                return None
-            with zf.open("word/settings.xml") as f:
-                tree = ET.parse(f)
-        el = tree.find(f".//{{{W_NS}}}biblioStyle")
-        if el is None:
-            return None
-        return el.get(f"{{{W_NS}}}val")
+            names = zf.namelist()
+
+            # 1. Try word/settings.xml
+            if "word/settings.xml" in names:
+                with zf.open("word/settings.xml") as f:
+                    tree = ET.parse(f)
+                el = tree.find(f".//{{{W_NS}}}biblioStyle")
+                if el is not None:
+                    val = el.get(f"{{{W_NS}}}val")
+                    if val:
+                        return val
+
+            # 2. Try customXml/item1.xml (b:Sources StyleName="...")
+            for name in names:
+                if name.startswith("customXml/item") and name.endswith(".xml"):
+                    # Avoid the itemProps sidecars
+                    if "Props" in name:
+                        continue
+                    with zf.open(name) as f:
+                        raw = f.read()
+                    if b"Sources" not in raw:
+                        continue
+                    tree = ET.fromstring(raw)
+                    # Root may be <b:Sources> or contain it.
+                    targets = []
+                    if tree.tag == f"{{{B_NS}}}Sources":
+                        targets = [tree]
+                    else:
+                        targets = tree.findall(f".//{{{B_NS}}}Sources")
+                    for src_el in targets:
+                        val = src_el.get("StyleName")
+                        if val:
+                            return val
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _parse_citation_instr(instr: str) -> Tuple[List[str], Optional[str]]:
@@ -1175,22 +1207,33 @@ def _build_citation_map(body) -> Dict[str, int]:
 
 
 def _is_bibliography_sdt(sdt_el) -> bool:
-    """Return True if *sdt_el* is a Word bibliography structured document tag."""
+    """Return True if *sdt_el* is a Word bibliography structured document tag.
+
+    Word marks the bibliography SDT in one of three ways depending on version:
+    1. <w:bibliography/> inside <w:sdtPr>  (most common, used by modern Word)
+    2. <w:tag w:val="Bibliography"/> inside <w:sdtPr>
+    3. <w:docPart><w:docPartGallery w:val="Bibliographies"/>
+    """
     sdtPr = sdt_el.find(qn("w:sdtPr"))
     if sdtPr is None:
         return False
-    # Explicit <w:tag w:val="Bibliography"/> marker.
+    # 1. <w:bibliography/> — the definitive marker in current Word versions.
+    if sdtPr.find(qn("w:bibliography")) is not None:
+        return True
+    # 2. Explicit <w:tag w:val="Bibliography"/> marker.
     tag_el = sdtPr.find(qn("w:tag"))
     if tag_el is not None:
         if "bibliography" in tag_el.get(qn("w:val"), "").lower():
             return True
-    # <w:docPart><w:docPartGallery w:val="Bibliographies"/>
-    docPart = sdtPr.find(qn("w:docPart"))
-    if docPart is not None:
-        gallery = docPart.find(qn("w:docPartGallery"))
-        if gallery is not None:
-            if "bibliograph" in gallery.get(qn("w:val"), "").lower():
-                return True
+    # 3. <w:docPart> or <w:docPartObj> containing
+    #    <w:docPartGallery w:val="Bibliographies"/>
+    for container_tag in (qn("w:docPart"), qn("w:docPartObj")):
+        docPart = sdtPr.find(container_tag)
+        if docPart is not None:
+            gallery = docPart.find(qn("w:docPartGallery"))
+            if gallery is not None:
+                if "bibliograph" in gallery.get(qn("w:val"), "").lower():
+                    return True
     return False
 
 
@@ -2606,44 +2649,100 @@ class DocxToMarkdown:
     def _render_bibliography_sdt(self, sdt_el) -> str:
         """Render a Word bibliography SDT as Markdown.
 
-        The heading paragraph (if any) is emitted at its Word heading level.
-        Reference entry paragraphs are flattened to plain text (no bold/italic
-        etc.) and prefixed with an HTML anchor ``<a id="ref-N"></a>`` derived
-        from the leading ``[N]`` in the entry text.  Anchors are only added
-        when ``_citation_map`` is populated (IEEE mode).
+        Word formats IEEE bibliographies in one of two layouts inside the SDT:
+
+        *Paragraph layout* (simple/older): a sequence of ``<w:p>`` elements
+        where each paragraph is one reference entry.
+
+        *Table layout* (current Word default for IEEE): a ``<w:tbl>`` where
+        each row has two cells — column 1 is ``[N]`` and column 2 is the
+        reference text.  An empty ``<w:p>`` containing a BIBLIOGRAPHY field
+        may appear before the table and is skipped.
+
+        In both cases entries are flattened to plain text (formatting stripped)
+        and prefixed with ``<a id="ref-N"></a>`` when the citation map is
+        populated (IEEE mode).
         """
         sdtContent = sdt_el.find(qn("w:sdtContent"))
         if sdtContent is None:
             return ""
 
         blocks: List[str] = []
-        for child in sdtContent:
-            if child.tag != qn("w:p"):
-                continue
-            para = DocxParagraph(child, self.doc)
-            style_name = (para.style.name if para.style else "Normal") or "Normal"
 
-            # Heading paragraph: render at the appropriate MD heading level.
-            m = re.match(r"^Heading (\d)$", style_name)
-            if m:
-                level = int(m.group(1))
-                text = self._raw_text(para).strip()
-                if text:
-                    blocks.append(("#" * level) + " " + text)
-                continue
+        def _para_text(p_el) -> str:
+            parts = []
+            for el in p_el.iter():
+                if el.tag == qn("w:t") and el.text:
+                    parts.append(el.text)
+                elif el.tag == qn("w:tab"):
+                    parts.append("\t")
+            return "".join(parts)
 
-            # Reference entry: flatten to plain text.
-            text = self._raw_text(para).strip()
+        def _emit_entry(text: str) -> None:
+            text = text.strip()
             if not text:
-                continue
-
-            # Prepend anchor when citation map is available.
+                return
             num_match = re.match(r"^\[(\d+)\]", text)
             if num_match and self._citation_map:
                 num = int(num_match.group(1))
                 blocks.append(f'<a id="ref-{num}"></a>{text}')
             else:
                 blocks.append(text)
+
+        def _process_content(content_el) -> None:
+            for child in content_el:
+                tag = child.tag
+
+                # --- Paragraph layout ---
+                if tag == qn("w:p"):
+                    para = DocxParagraph(child, self.doc)
+                    style_name = (para.style.name if para.style else "Normal") or "Normal"
+                    m = re.match(r"^Heading (\d)$", style_name)
+                    if m:
+                        level = int(m.group(1))
+                        text = _para_text(child).strip()
+                        if text:
+                            blocks.append(("#" * level) + " " + text)
+                        continue
+                    # Skip paragraphs that only carry a BIBLIOGRAPHY field
+                    # (no visible text of their own).
+                    raw = _para_text(child).strip()
+                    if raw:
+                        _emit_entry(raw)
+
+                # --- Table layout (IEEE default in current Word) ---
+                elif tag == qn("w:tbl"):
+                    for row in child.findall(qn("w:tr")):
+                        cells = row.findall(qn("w:tc"))
+                        if not cells:
+                            continue
+                        if len(cells) >= 2:
+                            # Col 1 = "[N] ", col 2 = reference text.
+                            num_text = "".join(
+                                _para_text(p) for p in cells[0].iter()
+                                if p.tag == qn("w:p")
+                            )
+                            ref_text = "".join(
+                                _para_text(p) for p in cells[1].iter()
+                                if p.tag == qn("w:p")
+                            )
+                            combined = (num_text.rstrip() + " " + ref_text.strip()).strip()
+                            _emit_entry(combined)
+                        else:
+                            row_text = "".join(
+                                _para_text(p) for p in cells[0].iter()
+                                if p.tag == qn("w:p")
+                            )
+                            _emit_entry(row_text)
+
+                # --- Nested SDT (Word wraps the bibliography table in an
+                #     inner SDT with <w:bibliography/>) ---
+                elif tag == qn("w:sdt"):
+                    inner = child.find(qn("w:sdtContent"))
+                    if inner is not None:
+                        _process_content(inner)
+
+        _process_content(sdtContent)
 
         return "\n\n".join(blocks)
 
@@ -3028,6 +3127,15 @@ class DocxToMarkdown:
                     # Tracked changes already rejected earlier; smartTag
                     # is a wrapper around runs.
                     walk(child, link_url)
+
+                elif tag == qn("w:sdt"):
+                    # Inline SDTs (e.g. citation SDTs with <w:citation/> in
+                    # sdtPr) wrap their content in <w:sdtContent>; recurse
+                    # so the CITATION field runs are visible to the
+                    # field-state machine above.
+                    sdt_content = child.find(qn("w:sdtContent"))
+                    if sdt_content is not None:
+                        walk(sdt_content, link_url)
                 # other children (bookmarks, comment refs, etc) ignored
 
         walk(para._p, None)
@@ -3146,7 +3254,7 @@ class DocxToMarkdown:
             key = p.fmt_key()
             while j < len(pieces):
                 q = pieces[j]
-                if q.is_image or q.text == "  \n" or q.fmt_key() != key:
+                if q.is_image or q.is_raw or q.text == "  \n" or q.fmt_key() != key:
                     break
                 buf.append(q.text)
                 j += 1
