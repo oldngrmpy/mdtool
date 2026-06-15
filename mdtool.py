@@ -3129,12 +3129,59 @@ class DocxToMarkdown:
                     walk(child, link_url)
 
                 elif tag == qn("w:sdt"):
-                    # Inline SDTs (e.g. citation SDTs with <w:citation/> in
-                    # sdtPr) wrap their content in <w:sdtContent>; recurse
-                    # so the CITATION field runs are visible to the
-                    # field-state machine above.
+                    # Citation SDTs: render the CITATION field as a raw
+                    # hyperlink and preserve leading/trailing whitespace
+                    # from the display text (Word inserts a leading space
+                    # before the bracket that we must keep).
+                    # Other inline SDTs recurse transparently.
+                    sdtPr = child.find(qn("w:sdtPr"))
                     sdt_content = child.find(qn("w:sdtContent"))
-                    if sdt_content is not None:
+                    is_citation_sdt = (
+                        sdtPr is not None
+                        and sdtPr.find(qn("w:citation")) is not None
+                        and self._citation_map
+                        and sdt_content is not None
+                    )
+                    if is_citation_sdt:
+                        # Extract CITATION field instruction from sdtContent.
+                        instr_parts: List[str] = []
+                        display_text = ""
+                        depth = 0
+                        in_display = False
+                        for run in sdt_content.iter(qn("w:r")):
+                            fc = run.find(qn("w:fldChar"))
+                            if fc is not None:
+                                ft = fc.get(qn("w:fldCharType"), "")
+                                if ft == "begin":
+                                    depth += 1
+                                elif ft == "separate":
+                                    in_display = True
+                                elif ft == "end":
+                                    depth = max(0, depth - 1)
+                                    in_display = False
+                                continue
+                            ie = run.find(qn("w:instrText"))
+                            if ie is not None and depth == 1:
+                                instr_parts.append(ie.text or "")
+                                continue
+                            if in_display:
+                                for t_el in run.iter(qn("w:t")):
+                                    display_text += t_el.text or ""
+                        instr = "".join(instr_parts).strip()
+                        md = self._render_citation_md(instr) if instr.upper().startswith("CITATION") else None
+                        if md is not None:
+                            # Preserve leading/trailing whitespace from
+                            # the citation display text (e.g. " [1]").
+                            lead = len(display_text) - len(display_text.lstrip())
+                            trail = len(display_text) - len(display_text.rstrip())
+                            ws_before = display_text[:lead] if lead else ""
+                            ws_after = display_text[len(display_text)-trail:] if trail else ""
+                            pieces.append(_RunPiece(text=ws_before + md + ws_after, is_raw=True))
+                        else:
+                            # Unknown tags — fall back to display text.
+                            if display_text:
+                                pieces.append(_RunPiece(text=display_text))
+                    elif sdt_content is not None:
                         walk(sdt_content, link_url)
                 # other children (bookmarks, comment refs, etc) ignored
 
