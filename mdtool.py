@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mdtool v1.6.1  (3 Jun 2026)
+mdtool v1.7  (15 Jun 2026)
 https://github.com/oldngrmpy/mdtool
 
 Manual CLI utility for managing Markdown files via Microsoft Word on Windows.
@@ -29,6 +29,19 @@ Out of scope: git/GitHub integration, recursive directory traversal,
 filesystem monitoring.
 
 Changelog:
+    1.7 (15 Jun 2026)
+        togit now converts Word structured citations (Insert Citation) and the
+        bibliography section (References > Bibliography) to Markdown.  Only
+        IEEE style is supported; any other bibliography style detected in
+        word/settings.xml causes the sync to fail with an informative error.
+        In-text citations become intra-document hyperlinks: [[1]](#ref-1) for
+        a single citation, [[1](#ref-1), [2](#ref-2)] for adjacent citations,
+        and [[1, p. 5](#ref-1)] when a page annotation is present.  The
+        bibliography section is rendered using the heading level from Word
+        (matching the style the author chose) followed by each reference entry
+        as flat plain text with an HTML anchor (<a id="ref-N">) prepended.
+        fromgit does not reconstruct Word citations from Markdown; references
+        produced by togit round-trip as plain text only.  See Limitations.
     1.6.1 (3 Jun 2026)
         togit now stores a pixel_hash (SHA-256 of raw pixel buffer before
         encoding) alongside the existing encoded-bytes hash in the asset
@@ -77,6 +90,8 @@ import os
 import re
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -1054,6 +1069,129 @@ NS = {
 
 MC_FALLBACK_TAG = f"{{{NS['mc']}}}Fallback"
 MC_CHOICE_TAG = f"{{{NS['mc']}}}Choice"
+
+
+# ---------------------------------------------------------------------------
+# IEEE citation helpers (togit)
+# ---------------------------------------------------------------------------
+
+def _get_bibliography_style(docx_path: Path) -> Optional[str]:
+    """Return the Word bibliography style name from word/settings.xml, or None.
+
+    Reads directly from the zip to avoid any python-docx abstraction gap.
+    Returns None if the file is unreadable or the element is absent.
+    """
+    W_NS = NS["w"]
+    try:
+        with zipfile.ZipFile(str(docx_path), "r") as zf:
+            if "word/settings.xml" not in zf.namelist():
+                return None
+            with zf.open("word/settings.xml") as f:
+                tree = ET.parse(f)
+        el = tree.find(f".//{{{W_NS}}}biblioStyle")
+        if el is None:
+            return None
+        return el.get(f"{{{W_NS}}}val")
+    except Exception:
+        return None
+
+
+def _parse_citation_instr(instr: str) -> Tuple[List[str], Optional[str]]:
+    """Parse a CITATION field instruction string.
+
+    Returns (tags, page_annotation) where *tags* is a list of citation-tag
+    strings in the order they appear in the instruction and *page_annotation*
+    is the value of the \\p switch, or None if absent.
+
+    Examples::
+
+        "CITATION Nguyen2020 \\l 3081"            -> (["Nguyen2020"], None)
+        "CITATION Nguyen2020 \\l 3081 \\p \\"p. 5\\""
+                                                  -> (["Nguyen2020"], "p. 5")
+        "CITATION Alpha2020 Beta2019 \\l 3081"    -> (["Alpha2020", "Beta2019"], None)
+    """
+    rest = instr.strip()
+    if rest.upper().startswith("CITATION"):
+        rest = rest[8:].strip()
+
+    tags: List[str] = []
+    page: Optional[str] = None
+    tokens = rest.split()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        # Switches start with a backslash character.
+        if len(tok) >= 2 and tok[0] == chr(92):
+            sw = tok[1:].lower()
+            if sw == "p" and i + 1 < len(tokens):
+                i += 1
+                # Page value may be quoted and span multiple tokens.
+                pval = tokens[i]
+                if pval.startswith('"'):
+                    pval = pval[1:]
+                    while not pval.endswith('"') and i + 1 < len(tokens):
+                        i += 1
+                        pval += " " + tokens[i]
+                    pval = pval.rstrip('"')
+                page = pval.strip() or None
+            elif sw in ("l", "m") and i + 1 < len(tokens):
+                # \l = locale code, \m = suppress-author tag — consume value.
+                i += 1
+            # \f, \t, and other single-char switches take no value; skip.
+        else:
+            tags.append(tok)
+        i += 1
+
+    return tags, page
+
+
+def _build_citation_map(body) -> Dict[str, int]:
+    """Scan *body* XML for CITATION field instructions and number each tag.
+
+    Tags are numbered in first-appearance order (IEEE convention).  The
+    bibliography SDT is scanned too but in-text citations appear earlier so
+    their first-appearance order is preserved.
+    """
+    tag_order: Dict[str, int] = {}
+    counter = 0
+
+    def scan(node) -> None:
+        nonlocal counter
+        for child in node:
+            if child.tag == qn("w:r"):
+                instr_el = child.find(qn("w:instrText"))
+                if instr_el is not None and instr_el.text:
+                    text = instr_el.text.strip()
+                    if text.upper().startswith("CITATION"):
+                        tags, _ = _parse_citation_instr(text)
+                        for t in tags:
+                            if t not in tag_order:
+                                counter += 1
+                                tag_order[t] = counter
+            scan(child)
+
+    scan(body)
+    return tag_order
+
+
+def _is_bibliography_sdt(sdt_el) -> bool:
+    """Return True if *sdt_el* is a Word bibliography structured document tag."""
+    sdtPr = sdt_el.find(qn("w:sdtPr"))
+    if sdtPr is None:
+        return False
+    # Explicit <w:tag w:val="Bibliography"/> marker.
+    tag_el = sdtPr.find(qn("w:tag"))
+    if tag_el is not None:
+        if "bibliography" in tag_el.get(qn("w:val"), "").lower():
+            return True
+    # <w:docPart><w:docPartGallery w:val="Bibliographies"/>
+    docPart = sdtPr.find(qn("w:docPart"))
+    if docPart is not None:
+        gallery = docPart.find(qn("w:docPartGallery"))
+        if gallery is not None:
+            if "bibliograph" in gallery.get(qn("w:val"), "").lower():
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2226,13 +2364,14 @@ class _RunPiece:
     """One contiguous text piece with formatting flags and optional link."""
 
     __slots__ = ("text", "bold", "italic", "code", "strike", "link",
-                 "is_image", "image_index")
+                 "is_image", "image_index", "is_raw")
 
     def __init__(self, text: str = "", *, bold: bool = False,
                  italic: bool = False, code: bool = False,
                  strike: bool = False, link: Optional[str] = None,
                  is_image: bool = False,
-                 image_index: Optional[int] = None) -> None:
+                 image_index: Optional[int] = None,
+                 is_raw: bool = False) -> None:
         self.text = text
         self.bold = bold
         self.italic = italic
@@ -2241,6 +2380,7 @@ class _RunPiece:
         self.link = link
         self.is_image = is_image
         self.image_index = image_index
+        self.is_raw = is_raw
 
     def fmt_key(self) -> Tuple:
         return (self.bold, self.italic, self.code, self.strike, self.link)
@@ -2330,7 +2470,8 @@ class _NumberingResolver:
 class DocxToMarkdown:
     def __init__(self, doc, docx_path: Path,
                  image_filenames: List[str],
-                 tracker: Optional[PageTracker] = None) -> None:
+                 tracker: Optional[PageTracker] = None,
+                 citation_map: Optional[Dict[str, int]] = None) -> None:
         self.doc = doc
         self.docx_path = docx_path
         # image_filenames[i] is the final filename (no path) for the i-th
@@ -2339,6 +2480,9 @@ class DocxToMarkdown:
         self._image_counter = 0  # next image index to consume
         self.tracker = tracker
         self._numbering = _NumberingResolver(doc)
+        # {citation_tag: ref_number} for IEEE in-text citation hyperlinks.
+        # Empty dict means no citation processing.
+        self._citation_map: Dict[str, int] = citation_map or {}
 
     # --- public ---
 
@@ -2433,6 +2577,15 @@ class DocxToMarkdown:
                 blocks.append(self._render_table(table))
                 i += 1
 
+            elif tag == qn("w:sdt"):
+                # Structured document tags: only the bibliography SDT is
+                # rendered; all others are skipped (current behaviour).
+                if _is_bibliography_sdt(el):
+                    bib_md = self._render_bibliography_sdt(el)
+                    if bib_md:
+                        blocks.append(bib_md)
+                i += 1
+
             else:
                 # Section properties, bookmarks etc - ignored.
                 i += 1
@@ -2447,6 +2600,81 @@ class DocxToMarkdown:
 
         # Join with blank lines between blocks. Trailing newline.
         return "\n\n".join(blocks).rstrip() + "\n"
+
+    # --- bibliography rendering ---
+
+    def _render_bibliography_sdt(self, sdt_el) -> str:
+        """Render a Word bibliography SDT as Markdown.
+
+        The heading paragraph (if any) is emitted at its Word heading level.
+        Reference entry paragraphs are flattened to plain text (no bold/italic
+        etc.) and prefixed with an HTML anchor ``<a id="ref-N"></a>`` derived
+        from the leading ``[N]`` in the entry text.  Anchors are only added
+        when ``_citation_map`` is populated (IEEE mode).
+        """
+        sdtContent = sdt_el.find(qn("w:sdtContent"))
+        if sdtContent is None:
+            return ""
+
+        blocks: List[str] = []
+        for child in sdtContent:
+            if child.tag != qn("w:p"):
+                continue
+            para = DocxParagraph(child, self.doc)
+            style_name = (para.style.name if para.style else "Normal") or "Normal"
+
+            # Heading paragraph: render at the appropriate MD heading level.
+            m = re.match(r"^Heading (\d)$", style_name)
+            if m:
+                level = int(m.group(1))
+                text = self._raw_text(para).strip()
+                if text:
+                    blocks.append(("#" * level) + " " + text)
+                continue
+
+            # Reference entry: flatten to plain text.
+            text = self._raw_text(para).strip()
+            if not text:
+                continue
+
+            # Prepend anchor when citation map is available.
+            num_match = re.match(r"^\[(\d+)\]", text)
+            if num_match and self._citation_map:
+                num = int(num_match.group(1))
+                blocks.append(f'<a id="ref-{num}"></a>{text}')
+            else:
+                blocks.append(text)
+
+        return "\n\n".join(blocks)
+
+    def _render_citation_md(self, instr: str) -> Optional[str]:
+        """Render a CITATION field instruction as a Markdown hyperlink string.
+
+        Returns a raw Markdown fragment such as ``[[1]](#ref-1)`` or
+        ``[[1](#ref-1), [2](#ref-2)]`` for multi-tag citations, or
+        ``[[1, p. 5](#ref-1)]`` when a page annotation is present.
+
+        Returns None if any tag cannot be resolved in the citation map; the
+        caller falls back to letting the field's display text render as plain
+        text.
+        """
+        tags, page = _parse_citation_instr(instr)
+        if not tags:
+            return None
+
+        parts: List[str] = []
+        for j, tag in enumerate(tags):
+            num = self._citation_map.get(tag)
+            if num is None:
+                return None  # Unknown tag — fall back to display text.
+            is_last = (j == len(tags) - 1)
+            if is_last and page:
+                display = f"{num}, {page}"
+            else:
+                display = str(num)
+            parts.append(f"[{display}](#ref-{num})")
+
+        return "[" + ", ".join(parts) + "]"
 
     # --- list rendering ---
 
@@ -2718,12 +2946,28 @@ class DocxToMarkdown:
         return self._emit_pieces(pieces, in_table=in_table)
 
     def _collect_pieces(self, para: DocxParagraph) -> List[_RunPiece]:
-        """Walk paragraph XML and produce a flat list of run pieces."""
+        """Walk paragraph XML and produce a flat list of run pieces.
+
+        Handles Word field codes (w:fldChar / w:instrText sequences) so that
+        structured CITATION fields are converted to Markdown citation
+        hyperlinks rather than their plain display text.  Non-CITATION fields
+        and unresolvable citations fall back transparently to the field's
+        display text.
+        """
         pieces: List[_RunPiece] = []
 
+        # Field-code state machine.  We only intercept depth-1 CITATION fields;
+        # nested fields and all other field types are left to render naturally.
+        field_depth = 0
+        field_instr_parts: List[str] = []
+        skip_field_result = False  # True while consuming CITATION display text
+
         def walk(node, link_url: Optional[str]) -> None:
+            nonlocal field_depth, field_instr_parts, skip_field_result
+
             for child in node:
                 tag = child.tag
+
                 if tag == qn("w:hyperlink"):
                     # Resolve r:id to URL via paragraph's part rels.
                     r_id = child.get(qn("r:id"))
@@ -2734,8 +2978,52 @@ class DocxToMarkdown:
                         except KeyError:
                             url = None
                     walk(child, url)
+
                 elif tag == qn("w:r"):
+                    # --- Field control character ---
+                    fldChar = child.find(qn("w:fldChar"))
+                    if fldChar is not None:
+                        ftype = fldChar.get(qn("w:fldCharType"), "")
+                        if ftype == "begin":
+                            field_depth += 1
+                            if field_depth == 1:
+                                field_instr_parts = []
+                                skip_field_result = False
+                        elif ftype == "separate":
+                            if field_depth == 1 and self._citation_map:
+                                instr = "".join(field_instr_parts).strip()
+                                if instr.upper().startswith("CITATION"):
+                                    md = self._render_citation_md(instr)
+                                    if md is not None:
+                                        pieces.append(
+                                            _RunPiece(text=md, is_raw=True)
+                                        )
+                                        skip_field_result = True
+                                    # If md is None (unknown tag), let the
+                                    # field's display text render normally.
+                        elif ftype == "end":
+                            if field_depth == 1:
+                                skip_field_result = False
+                                field_instr_parts = []
+                            field_depth = max(0, field_depth - 1)
+                        # Field-control runs carry no visible text; skip.
+                        continue
+
+                    # --- Instruction text (between begin and separate) ---
+                    instr_el = child.find(qn("w:instrText"))
+                    if instr_el is not None:
+                        if field_depth == 1:
+                            field_instr_parts.append(instr_el.text or "")
+                        # Instruction runs carry no visible text; skip.
+                        continue
+
+                    # --- Normal run ---
+                    # Skip if we are consuming the display-text result of a
+                    # CITATION field that has already been rendered.
+                    if skip_field_result and field_depth > 0:
+                        continue
                     self._process_run(child, pieces, link_url)
+
                 elif tag == qn("w:smartTag") or tag == qn("w:ins"):
                     # Tracked changes already rejected earlier; smartTag
                     # is a wrapper around runs.
@@ -2839,6 +3127,12 @@ class DocxToMarkdown:
             p = pieces[i]
             if p.is_image:
                 out.append(self._format_image(p))
+                i += 1
+                continue
+            # Pre-rendered raw strings (e.g. citation hyperlinks): emit
+            # verbatim without escaping or coalescing.
+            if p.is_raw:
+                out.append(p.text)
                 i += 1
                 continue
             # Hard break tokens are preserved verbatim.
@@ -3071,6 +3365,23 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
     # Tracked changes: refuse to convert.
     _check_tracked_changes(doc, docx_path, tracker)
 
+    # Bibliography style check.  Only IEEE is supported; any other style
+    # detected in word/settings.xml causes an early failure.
+    bib_style = _get_bibliography_style(docx_path)
+    if bib_style is not None and bib_style.upper() != "IEEE":
+        fail(
+            f"{docx_path.name}: bibliography style '{bib_style}' is not "
+            f"supported. Only IEEE style is supported by mdtool. Change the "
+            f"citation style in Word (References → Style → IEEE) "
+            f"then update the bibliography before running togit again."
+        )
+    # Build tag→number map only when IEEE style is active.
+    citation_map: Dict[str, int] = (
+        _build_citation_map(doc.element.body)
+        if (bib_style and bib_style.upper() == "IEEE")
+        else {}
+    )
+
     # Extract and render all inline images in document order, compositing
     # any wholly-contained floating annotation shapes.
     extracted: List[ExtractedImage] = []
@@ -3150,7 +3461,8 @@ def convert_docx_to_markdown(docx_path: Path, md_path: Path, git_dir: Path,
 
     # Render markdown.
     converter = DocxToMarkdown(doc, docx_path, final_filenames,
-                               tracker=tracker)
+                               tracker=tracker,
+                               citation_map=citation_map)
     # Stash alts on the converter for emission.
     converter._image_alts = final_alts  # type: ignore[attr-defined]
     md_text = converter.render()
